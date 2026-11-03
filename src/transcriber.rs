@@ -147,6 +147,9 @@ impl TranscriberService {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        params.set_suppress_blank(true);
+        params.set_suppress_nst(true);
+        params.set_no_speech_thold(0.6);
 
         let lang_clean = lang.trim().to_lowercase();
         if lang_clean != "auto" && !lang_clean.is_empty() {
@@ -165,6 +168,7 @@ impl TranscriberService {
 
         let mut segments = Vec::new();
         let mut lrc_lines = Vec::new();
+        let mut last_text = String::new();
 
         for i in 0..num_segments {
             let start_sec = (state.full_get_segment_t0(i).unwrap_or(0) as f64) / 100.0;
@@ -175,9 +179,10 @@ impl TranscriberService {
                 .trim()
                 .to_string();
 
-            if text.is_empty() {
+            if text.is_empty() || text == last_text {
                 continue;
             }
+            last_text = text.clone();
 
             let ts = format_lrc_timestamp(start_sec);
             lrc_lines.push(format!("{ts}{text}"));
