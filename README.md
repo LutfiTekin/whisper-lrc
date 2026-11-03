@@ -16,6 +16,9 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
 * **Idle VRAM/RAM Eviction (10-min TTL)**:
   * When the queue is idle for 10 minutes, the model is evicted from VRAM/RAM (`cudaFree`), freeing resources for video transcoding or background tasks.
   * Reloads on-demand from SSD in $\sim$1.5s when a new track arrives.
+* **Native Vocal Isolation (Demucs)**:
+  * Built-in multi-stem separator isolates pure singing phonemes from loud instruments before transcription.
+  * Eliminates acoustic distortion from drums, bass, and guitars for crystal-clear lyrics.
 * **State-of-the-Art Whisper Model**:
   * Powered by full 32-layer **`large-v3-q5_0`** (5-bit quantization, $\sim$1.08 GB).
   * Runs 100% on GPU (CUDA) using only $\sim$1.4 GB VRAM for maximum accuracy and fast inference.
@@ -42,6 +45,7 @@ Accepts an uploaded audio file or server-local file path.
 * `file`: Audio file binary (MP3, WAV, FLAC, AAC)
 * `filepath`: Server-local file path (optional zero-copy alternative to upload)
 * `lang`: Language code, e.g. `ja` (default), `en`, `tr`, or `auto`
+* `isolate`: `true` (default) or `false` (skips vocal isolation for podcasts or speech)
 * `format`: `lrc` (default, returns `text/plain`) or `json`
 * `refresh`: `false` (default) or `true` (forces fresh inference, bypassing cache)
 

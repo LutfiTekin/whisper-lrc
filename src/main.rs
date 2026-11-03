@@ -15,6 +15,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use whisper_lrc::audio::decode_audio_to_16k_mono;
 use whisper_lrc::cache::{CacheKey, LrcCache};
+use whisper_lrc::isolation::isolate_vocals;
 use whisper_lrc::queue::{start_worker_loop, PreemptiveQueue};
 use whisper_lrc::transcriber::TranscriberService;
 
@@ -104,6 +105,7 @@ async fn handle_health() -> impl IntoResponse {
         "status": "healthy",
         "service": "whisper-lrc",
         "model": "ggml-large-v3-q5_0",
+        "vocal_isolation": "demucs-htdemucs",
         "runtime": "rust-axum"
     }))
 }
@@ -125,6 +127,7 @@ async fn handle_lyrics(
     let mut lang = "ja".to_string();
     let mut output_format = "lrc".to_string();
     let mut refresh = false;
+    let mut isolate = true; // Default to true for crystal-clear lyrics
 
     while let Some(field) = multipart
         .next_field()
@@ -147,6 +150,13 @@ async fn handle_lyrics(
                     .await
                     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid filepath field: {e}")))?;
                 filepath = Some(text.trim().to_string());
+            }
+            "isolate" | "isolate_vocals" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid isolate field: {e}")))?;
+                isolate = !text.trim().eq_ignore_ascii_case("false") && text.trim() != "0";
             }
             "lang" => {
                 let text = field
@@ -197,6 +207,7 @@ async fn handle_lyrics(
     let cache_key = CacheKey {
         audio_hash: audio_hash.clone(),
         lang: lang.clone(),
+        isolate,
     };
 
     // 1. In-memory Cache Check
@@ -209,6 +220,7 @@ async fn handle_lyrics(
                     Json(json!({
                         "lrc": cached_lrc,
                         "lang": lang,
+                        "isolated": isolate,
                         "cached": true
                     })),
                 )
@@ -227,26 +239,40 @@ async fn handle_lyrics(
         }
     }
 
-    // 2. Decode audio to 16kHz mono PCM & get duration
-    let decoded = tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&raw_bytes))
+    // 2. Vocal Isolation (Demucs) if enabled
+    let audio_to_decode = if isolate {
+        tracing::info!("Running Demucs vocal isolation on CPU...");
+        match isolate_vocals(&raw_bytes).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Demucs vocal isolation failed, continuing with mixed audio: {e}");
+                raw_bytes
+            }
+        }
+    } else {
+        raw_bytes
+    };
+
+    // 3. Decode audio to 16kHz mono PCM & get duration
+    let decoded = tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&audio_to_decode))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?;
 
-    // 3. Submit to Preemptive Priority Queue
+    // 4. Submit to Preemptive Priority Queue
     let rx = state
         .queue
         .submit(decoded.pcm, decoded.duration_secs, lang.clone())
         .await
         .map_err(|e| (StatusCode::TOO_MANY_REQUESTS, e))?;
 
-    // 4. Await worker completion
+    // 5. Await worker completion
     let result = rx
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Worker dropped job channel".to_string()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // 5. Store in LRU cache
+    // 6. Store in LRU cache
     state.cache.insert(cache_key, result.lrc.clone()).await;
 
     if output_format == "json" {

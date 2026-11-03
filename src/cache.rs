@@ -5,6 +5,7 @@ use std::time::Duration;
 pub struct CacheKey {
     pub audio_hash: String,
     pub lang: String,
+    pub isolate: bool,
 }
 
 #[derive(Clone)]
