@@ -48,11 +48,11 @@ pub fn decode_audio_to_16k_mono(bytes: &[u8]) -> anyhow::Result<DecodedAudio> {
 
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
+                let channels = audio_buf.spec().channels.count();
                 let mut sample_buf =
                     SampleBuffer::<f32>::new(audio_buf.capacity() as u64, *audio_buf.spec());
                 sample_buf.copy_interleaved_ref(audio_buf);
 
-                let channels = sample_buf.spec().channels.count();
                 let samples = sample_buf.samples();
 
                 if channels == 1 {

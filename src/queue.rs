@@ -212,7 +212,6 @@ pub fn start_worker_loop(
             // Check if cancelled by preemption
             if job.cancel_token.is_cancelled() {
                 tracing::info!("Job id: {} was preempted. Re-queuing to heap.", job.id);
-                let (new_tx, _) = oneshot::channel();
                 let re_queued = Job {
                     id: job.id,
                     pcm: job.pcm,

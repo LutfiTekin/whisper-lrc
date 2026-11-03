@@ -59,8 +59,8 @@ pub struct TranscriptionResult {
 pub struct TranscriberService {
     model_dir: PathBuf,
     cpu_threads: i32,
-    normal_context: Arc<Mutex<Option<WhisperContext>>>,
-    high_context: Arc<Mutex<Option<WhisperContext>>>,
+    normal_context: Arc<Mutex<Option<Arc<WhisperContext>>>>,
+    high_context: Arc<Mutex<Option<Arc<WhisperContext>>>>,
     last_used: Arc<Mutex<Instant>>,
 }
 
@@ -113,7 +113,7 @@ impl TranscriberService {
         Ok(path)
     }
 
-    async fn get_or_load_context(&self, accuracy: Accuracy) -> Result<WhisperContext> {
+    async fn get_or_load_context(&self, accuracy: Accuracy) -> Result<Arc<WhisperContext>> {
         let mut guard = match accuracy {
             Accuracy::Normal => self.normal_context.lock().await,
             Accuracy::High => self.high_context.lock().await,
@@ -133,8 +133,9 @@ impl TranscriberService {
         let ctx = WhisperContext::new_with_params(path_str, ctx_params)
             .map_err(|e| anyhow::anyhow!("Failed initializing Whisper context: {e:?}"))?;
 
-        *guard = Some(ctx.clone());
-        Ok(ctx)
+        let arc_ctx = Arc::new(ctx);
+        *guard = Some(arc_ctx.clone());
+        Ok(arc_ctx)
     }
 
     /// Evicts loaded models from VRAM and RAM if idle time exceeds ttl_secs.
@@ -201,7 +202,7 @@ impl TranscriberService {
         }
 
         let abort_checker = is_aborted.clone();
-        params.set_abort_callback(Some(move || abort_checker.load(Ordering::SeqCst)));
+        params.set_abort_callback(Some(move |_| abort_checker.load(Ordering::SeqCst)));
 
         state
             .full(params, pcm_16k_mono)
