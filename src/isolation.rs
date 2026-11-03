@@ -1,13 +1,23 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use anyhow::{Context, Result};
-use burn::backend::NdArray;
 use demucs_core::model::metadata::{download_url, StemId, HTDEMUCS};
 use demucs_core::{Demucs, ModelOptions};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::audio::{decode_audio_to_stereo, stereo_to_16k_mono, DecodedAudio};
 
-type CpuBackend = NdArray<f32>;
+#[cfg(feature = "cuda")]
+type DemucsBackend = burn::backend::Cuda<f32, i32>;
+
+#[cfg(not(feature = "cuda"))]
+type DemucsBackend = burn::backend::NdArray<f32>;
+
+static ISOLATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn isolation_mutex() -> &'static Mutex<()> {
+    ISOLATION_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 async fn ensure_demucs_weights(model_dir: &Path) -> Result<PathBuf> {
     let path = model_dir.join(HTDEMUCS.filename);
@@ -45,11 +55,14 @@ async fn ensure_demucs_weights(model_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Isolates vocals from mixed audio bytes in-memory using pure-Rust `demucs-rs` (`demucs-core` HTDemucs v4)
-/// on CPU (Burn NdArray SIMD + multi-threading) and returns 16 kHz mono PCM `DecodedAudio`.
+/// on CUDA GPU (or CPU fallback) and returns 16 kHz mono PCM `DecodedAudio`.
 pub async fn isolate_vocals_to_16k_mono(
     audio_bytes: &[u8],
     model_dir: &Path,
 ) -> Result<DecodedAudio> {
+    // Ensure single-flight vocal isolation on GPU
+    let _guard = isolation_mutex().lock().await;
+
     let weights_path = ensure_demucs_weights(model_dir).await?;
     let weights_bytes = tokio::fs::read(&weights_path)
         .await
@@ -58,7 +71,10 @@ pub async fn isolate_vocals_to_16k_mono(
     let raw_owned = audio_bytes.to_vec();
     let (tx, rx) = oneshot::channel();
 
-    tracing::info!("demucs-rs: isolating vocal stem in pure Rust (HTDemucs v4)...");
+    #[cfg(feature = "cuda")]
+    tracing::info!("demucs-rs: isolating vocal stem on CUDA GPU (HTDemucs v4)...");
+    #[cfg(not(feature = "cuda"))]
+    tracing::info!("demucs-rs: isolating vocal stem on CPU (HTDemucs v4)...");
 
     std::thread::Builder::new()
         .name("demucs-rs-worker".into())
@@ -67,7 +83,7 @@ pub async fn isolate_vocals_to_16k_mono(
             let res = (|| -> Result<DecodedAudio> {
                 let stereo = decode_audio_to_stereo(&raw_owned)?;
                 let device = Default::default();
-                let model = Demucs::<CpuBackend>::from_bytes(
+                let model = Demucs::<DemucsBackend>::from_bytes(
                     ModelOptions::FourStem,
                     &weights_bytes,
                     device,

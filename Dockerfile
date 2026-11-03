@@ -42,6 +42,7 @@ RUN touch src/lib.rs src/main.rs && \
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_PATH=/usr/local/cuda \
     HOST=0.0.0.0 \
     PORT=9500 \
     MODEL_DIR=/models \
@@ -51,6 +52,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy NVRTC shared libraries and CUDA headers from builder for Burn CUDA kernel JIT
+COPY --from=builder /usr/local/cuda/include /usr/local/cuda/include
+COPY --from=builder /usr/local/cuda/targets/x86_64-linux/lib/libnvrtc* /usr/local/cuda/targets/x86_64-linux/lib/
 
 COPY --from=builder /usr/src/whisper-lrc/target/release/whisper-lrc /usr/local/bin/whisper-lrc
 
