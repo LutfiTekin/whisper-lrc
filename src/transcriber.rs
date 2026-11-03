@@ -15,6 +15,118 @@ pub fn format_lrc_timestamp(seconds: f64) -> String {
     format!("[{:02}:{:05.2}]", mins, remaining_secs)
 }
 
+/// Builds a Whisper `initial_prompt` from optional `artist`, `title`, and custom `prompt` fields.
+pub fn build_initial_prompt(
+    artist: Option<&str>,
+    title: Option<&str>,
+    custom_prompt: Option<&str>,
+) -> Option<String> {
+    let artist_clean = artist.map(str::trim).filter(|s| !s.is_empty());
+    let title_clean = title.map(str::trim).filter(|s| !s.is_empty());
+    let prompt_clean = custom_prompt.map(str::trim).filter(|s| !s.is_empty());
+
+    let meta_part = match (artist_clean, title_clean) {
+        (Some(a), Some(t)) => Some(format!("{a} - {t}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(t)) => Some(t.to_string()),
+        (None, None) => None,
+    };
+
+    let combined = match (meta_part, prompt_clean) {
+        (Some(m), Some(p)) => Some(format!("{m}. {p}")),
+        (Some(m), None) => Some(m),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    };
+
+    combined.map(|s| s.replace('\0', ""))
+}
+
+/// Returns `true` if a transcribed segment matches known Whisper silence/outro hallucinations
+/// or degenerate repetition loops.
+pub fn is_hallucination(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Strip common punctuation, brackets, and music symbols
+    let stripped: String = trimmed
+        .chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '.' | ',' | '!' | '?' | '。' | '、' | '！' | '？' | '…' | '・' | '〜' | '~'
+                        | '-' | '—' | '(' | ')' | '（' | '）' | '[' | ']' | '「' | '」' | '『'
+                        | '』' | '♪' | '♫' | '♬' | '"' | '\''
+                )
+        })
+        .collect();
+
+    if stripped.is_empty() {
+        return true;
+    }
+
+    let lower = stripped.to_lowercase();
+
+    // Exact match hallucinations (frequent during percussion/bell outros & silence)
+    const EXACT_DENYLIST: &[&str] = &[
+        "アーメン",
+        "あーめん",
+        "amen",
+        "ハレルヤ",
+        "hallelujah",
+        "ご視聴ありがとうございました",
+        "ご視聴ありがとうございます",
+        "視聴ありがとうございました",
+        "ありがとうございました",
+        "チャンネル登録お願いします",
+        "チャンネル登録よろしくお願いします",
+        "チャンネル登録",
+        "高評価",
+        "字幕",
+        "翻訳",
+        "おやすみなさい",
+    ];
+
+    if EXACT_DENYLIST.contains(&lower.as_str()) {
+        return true;
+    }
+
+    // Substring match for YouTube/subtitle watermark hallucinations
+    const SUBSTRING_DENYLIST: &[&str] = &[
+        "ご視聴ありがとう",
+        "チャンネル登録",
+        "subtitlesby",
+        "translatedby",
+        "amara.org",
+        "thankyouforwatching",
+        "thanksforwatching",
+    ];
+
+    if SUBSTRING_DENYLIST.iter().any(|pat| lower.contains(pat)) {
+        return true;
+    }
+
+    // Detect single-character degenerate repetition (e.g. "ああああああああ")
+    let mut prev_char = None;
+    let mut run_len = 0usize;
+    for ch in stripped.chars() {
+        if Some(ch) == prev_char {
+            run_len += 1;
+            if run_len >= 8 {
+                return true;
+            }
+        } else {
+            prev_char = Some(ch);
+            run_len = 1;
+        }
+    }
+
+    false
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LrcSegment {
     pub start: f64,
@@ -27,6 +139,8 @@ pub struct LrcSegment {
 pub struct TranscriptionResult {
     pub lrc: String,
     pub lang: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub segments: Vec<LrcSegment>,
 }
 
@@ -133,13 +247,17 @@ impl TranscriberService {
         &self,
         pcm_16k_mono: &[f32],
         lang: &str,
+        prompt: Option<&str>,
     ) -> Result<TranscriptionResult> {
         let ctx = self.get_or_load_context().await?;
         let mut state = ctx
             .create_state()
             .map_err(|e| anyhow::anyhow!("Failed to create Whisper state: {e:?}"))?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        });
         params.set_n_threads(self.cpu_threads);
         params.set_translate(false);
         params.set_no_context(true);
@@ -150,6 +268,19 @@ impl TranscriberService {
         params.set_suppress_blank(true);
         params.set_suppress_nst(true);
         params.set_no_speech_thold(0.6);
+        params.set_logprob_thold(-1.0);
+        params.set_entropy_thold(2.4);
+        params.set_temperature(0.0);
+        params.set_temperature_inc(0.2);
+
+        let clean_prompt = prompt
+            .map(|p| p.replace('\0', "").trim().to_string())
+            .filter(|p| !p.is_empty());
+
+        if let Some(ref p) = clean_prompt {
+            tracing::info!("Conditioning Whisper decoder with initial_prompt: \"{p}\"");
+            params.set_initial_prompt(p);
+        }
 
         let lang_clean = lang.trim().to_lowercase();
         if lang_clean != "auto" && !lang_clean.is_empty() {
@@ -174,14 +305,40 @@ impl TranscriberService {
             let start_sec = (state.full_get_segment_t0(i).unwrap_or(0) as f64) / 100.0;
             let end_sec = (state.full_get_segment_t1(i).unwrap_or(0) as f64) / 100.0;
             let text = state
-                .full_get_segment_text(i)
+                .full_get_segment_text_lossy(i)
                 .unwrap_or_default()
                 .trim()
                 .to_string();
 
-            if text.is_empty() || text == last_text {
+            if text.is_empty() || text == last_text || is_hallucination(&text) {
                 continue;
             }
+
+            // Filter out low-confidence noise segments by checking average token probability
+            if let Ok(n_tokens) = state.full_n_tokens(i) {
+                if n_tokens > 0 {
+                    let mut prob_sum = 0.0_f32;
+                    let mut prob_count = 0usize;
+                    for t in 0..n_tokens {
+                        if let Ok(p) = state.full_get_token_prob(i, t) {
+                            prob_sum += p;
+                            prob_count += 1;
+                        }
+                    }
+                    if prob_count > 0 {
+                        let avg_prob = prob_sum / (prob_count as f32);
+                        if avg_prob < 0.20 {
+                            tracing::debug!(
+                                "Dropping low-confidence segment (avg_prob={:.2}): {}",
+                                avg_prob,
+                                text
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
             last_text = text.clone();
 
             let ts = format_lrc_timestamp(start_sec);
@@ -206,6 +363,7 @@ impl TranscriberService {
         Ok(TranscriptionResult {
             lrc: lrc_output,
             lang: lang_clean,
+            prompt: clean_prompt,
             segments,
         })
     }

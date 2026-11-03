@@ -14,11 +14,13 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use whisper_lrc::audio::decode_audio_to_16k_mono;
+use whisper_lrc::audio::{
+    apply_rms_silence_gate, decode_audio_to_16k_mono, extract_audio_metadata,
+};
 use whisper_lrc::cache::{CacheKey, LrcCache};
 use whisper_lrc::isolation::isolate_vocals;
 use whisper_lrc::queue::{start_worker_loop, PreemptiveQueue};
-use whisper_lrc::transcriber::TranscriberService;
+use whisper_lrc::transcriber::{build_initial_prompt, TranscriberService};
 
 #[derive(Clone)]
 struct AppState {
@@ -32,6 +34,9 @@ struct LyricsQuery {
     hotlink: Option<String>,
     filepath: Option<String>,
     lang: Option<String>,
+    artist: Option<String>,
+    title: Option<String>,
+    prompt: Option<String>,
     isolate: Option<bool>,
     format: Option<String>,
     refresh: Option<bool>,
@@ -161,14 +166,32 @@ async fn fetch_hotlink_audio(url: &str) -> Result<Vec<u8>, (StatusCode, String)>
     Ok(bytes.to_vec())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_audio_pipeline(
     state: &AppState,
     raw_bytes: Vec<u8>,
     lang: String,
+    artist: Option<String>,
+    title: Option<String>,
+    prompt: Option<String>,
     isolate: bool,
     output_format: String,
     refresh: bool,
 ) -> Result<Response, (StatusCode, String)> {
+    // Auto-extract embedded ID3/Vorbis artist & title tags if not supplied in request
+    let (effective_artist, effective_title) = if artist.is_none() || title.is_none() {
+        let embedded = extract_audio_metadata(&raw_bytes);
+        (artist.or(embedded.artist), title.or(embedded.title))
+    } else {
+        (artist, title)
+    };
+
+    let initial_prompt = build_initial_prompt(
+        effective_artist.as_deref(),
+        effective_title.as_deref(),
+        prompt.as_deref(),
+    );
+
     // Calculate SHA-256 hash for in-memory LRU cache
     let mut hasher = Sha256::new();
     hasher.update(&raw_bytes);
@@ -178,6 +201,7 @@ async fn process_audio_pipeline(
         audio_hash: audio_hash.clone(),
         lang: lang.clone(),
         isolate,
+        prompt: initial_prompt.clone(),
     };
 
     // 1. In-memory Cache Check
@@ -190,6 +214,7 @@ async fn process_audio_pipeline(
                     Json(json!({
                         "lrc": cached_lrc,
                         "lang": lang,
+                        "prompt": initial_prompt,
                         "isolated": isolate,
                         "cached": true
                     })),
@@ -223,16 +248,25 @@ async fn process_audio_pipeline(
         raw_bytes
     };
 
-    // 3. Decode audio to 16kHz mono PCM & get duration
-    let decoded = tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&audio_to_decode))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?;
+    // 3. Decode audio to 16kHz mono PCM, apply RMS silence gate, & get duration
+    let decoded = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut d = decode_audio_to_16k_mono(&audio_to_decode)?;
+        apply_rms_silence_gate(&mut d.pcm, 16000, -42.0);
+        Ok(d)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?;
 
     // 4. Submit to Preemptive Priority Queue
     let rx = state
         .queue
-        .submit(decoded.pcm, decoded.duration_secs, lang.clone())
+        .submit(
+            decoded.pcm,
+            decoded.duration_secs,
+            lang.clone(),
+            initial_prompt.clone(),
+        )
         .await
         .map_err(|e| (StatusCode::TOO_MANY_REQUESTS, e))?;
 
@@ -274,6 +308,9 @@ async fn handle_lyrics_multipart(
     let mut filepath = query.filepath;
     let mut hotlink_url = query.url.or(query.hotlink);
     let mut lang = query.lang.unwrap_or_else(|| "ja".to_string());
+    let mut artist = query.artist;
+    let mut title = query.title;
+    let mut prompt = query.prompt;
     let mut output_format = query.format.unwrap_or_else(|| "lrc".to_string());
     let mut refresh = query.refresh.unwrap_or(false);
     let mut isolate = query.isolate.unwrap_or(true);
@@ -306,6 +343,27 @@ async fn handle_lyrics_multipart(
                     .await
                     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid filepath field: {e}")))?;
                 filepath = Some(text.trim().to_string());
+            }
+            "artist" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid artist field: {e}")))?;
+                artist = Some(text.trim().to_string());
+            }
+            "title" | "song" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid title field: {e}")))?;
+                title = Some(text.trim().to_string());
+            }
+            "prompt" | "initial_prompt" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid prompt field: {e}")))?;
+                prompt = Some(text.trim().to_string());
             }
             "isolate" | "isolate_vocals" => {
                 let text = field
@@ -357,7 +415,18 @@ async fn handle_lyrics_multipart(
         ));
     };
 
-    process_audio_pipeline(&state, raw_bytes, lang, isolate, output_format, refresh).await
+    process_audio_pipeline(
+        &state,
+        raw_bytes,
+        lang,
+        artist,
+        title,
+        prompt,
+        isolate,
+        output_format,
+        refresh,
+    )
+    .await
 }
 
 async fn handle_lyrics_query(
@@ -385,7 +454,18 @@ async fn handle_lyrics_query(
         ));
     };
 
-    process_audio_pipeline(&state, raw_bytes, lang, isolate, output_format, refresh).await
+    process_audio_pipeline(
+        &state,
+        raw_bytes,
+        lang,
+        query.artist,
+        query.title,
+        query.prompt,
+        isolate,
+        output_format,
+        refresh,
+    )
+    .await
 }
 
 async fn handle_lyrics_json(
@@ -413,5 +493,16 @@ async fn handle_lyrics_json(
         ));
     };
 
-    process_audio_pipeline(&state, raw_bytes, lang, isolate, output_format, refresh).await
+    process_audio_pipeline(
+        &state,
+        raw_bytes,
+        lang,
+        payload.artist,
+        payload.title,
+        payload.prompt,
+        isolate,
+        output_format,
+        refresh,
+    )
+    .await
 }

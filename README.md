@@ -20,6 +20,11 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
 * **Native Vocal Isolation (Demucs)**:
   * Built-in multi-stem separator isolates pure singing phonemes from loud instruments before transcription.
   * Eliminates acoustic distortion from drums, bass, and guitars for crystal-clear lyrics.
+* **Multi-Layer Anti-Hallucination & Metadata Conditioning**:
+  * **Auto-Prompting via Metadata (`artist`, `title`, `prompt`)**: Automatically extracts embedded ID3/Vorbis `Artist` and `TrackTitle` tags via `symphonia` (or uses request parameters) to seed Whisper's `initial_prompt`, preventing phonetic katakana fallback on archaic/stylized lyrics.
+  * **RMS Vocal Silence Gate**: Mutes sustained non-vocal passages ($\ge 1.0\text{s}$ below $-42\text{ dBFS}$) to pure digital zero so instrumental percussion/bell outros never trigger phantom speech.
+  * **Beam Search Decoding (`beam_size = 5`)**: Explores 5 simultaneous candidate paths instead of greedy single-token argmax, improving recognition of sustained vowels and choral singing.
+  * **Confidence & Hallucination Filtering**: Enforces `logprob_thold = -1.0`, `entropy_thold = 2.4`, per-segment token probability pruning (`avg_prob >= 0.20`), and a post-processing denylist for common training artifacts (`"アーメン"`, `"ご視聴ありがとうございました"`, repetition loops).
 * **State-of-the-Art Whisper Model**:
   * Powered by full 32-layer **`large-v3-q5_0`** (5-bit quantization, $\sim$1.08 GB).
   * Runs 100% on GPU (CUDA) using only $\sim$1.4 GB VRAM for maximum accuracy and fast inference.
@@ -47,33 +52,45 @@ Accepts an uploaded audio file, server-local file path, or **hotlink audio strea
 * `url`: Direct hotlink / streaming audio URL (e.g. `https://listen.example.com/stream/...`)
 * `filepath`: Server-local file path (optional zero-copy alternative to upload)
 * `lang`: Language code, e.g. `ja` (default), `en`, `tr`, or `auto`
+* `artist`: Optional artist name (auto-extracted from ID3/Vorbis tags if omitted)
+* `title`: Optional song title (auto-extracted from ID3/Vorbis tags if omitted)
+* `prompt`: Optional custom context/vocabulary hint appended to `initial_prompt`
 * `isolate`: `true` (default) or `false` (skips vocal isolation for podcasts or speech)
 * `format`: `lrc` (default, returns `text/plain`) or `json`
 * `refresh`: `false` (default) or `true` (forces fresh inference, bypassing cache)
 
 #### Example 1: Transcribe via Direct Hotlink URL (GET or POST)
 ```bash
-# Simple GET request with URL query parameter
-curl "http://localhost:9500/lyrics?url=https://listen.example.com/stream/track.mp3&lang=tr"
+# Simple GET request with URL, artist, and title query parameters
+curl "http://localhost:9500/lyrics?url=https://listen.example.com/stream/track.mp3&lang=ja&artist=Kenji%20Kawai&title=Making%20of%20a%20Cyborg"
 
 # Or via POST multipart form
 curl -X POST "http://localhost:9500/lyrics" \
   -F "url=https://listen.example.com/stream/track.mp3" \
-  -F "lang=tr"
+  -F "lang=ja" \
+  -F "artist=Kenji Kawai" \
+  -F "title=Making of a Cyborg"
 ```
 
 #### Example 2: Transcribe via File Upload
 ```bash
 curl -X POST "http://localhost:9500/lyrics" \
   -F "file=@song.mp3" \
-  -F "lang=ja"
+  -F "lang=ja" \
+  -F "artist=Kenji Kawai" \
+  -F "title=Making of a Cyborg"
 ```
 
 #### Example 3: Transcribe via JSON Body (`POST /lyrics/json`)
 ```bash
 curl -X POST "http://localhost:9500/lyrics/json" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://listen.example.com/stream/track.mp3", "lang": "tr"}'
+  -d '{
+    "url": "https://listen.example.com/stream/track.mp3",
+    "lang": "ja",
+    "artist": "Kenji Kawai",
+    "title": "Making of a Cyborg"
+  }'
 ```
 
 **Output:**
@@ -118,22 +135,35 @@ whisper-lrc = { path = "../whisper-lrc" }
 
 ```rust
 use std::path::PathBuf;
-use whisper_lrc::to_lrc;
+use whisper_lrc::{to_lrc, to_lrc_with_metadata};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let audio_bytes = tokio::fs::read("song.mp3").await?;
     let model_dir = PathBuf::from("./models");
 
+    // Automatically extracts ID3/Vorbis artist & title tags if present:
     let lrc = to_lrc(
         &audio_bytes,
         "ja",
         true, // isolate_vocals_first (via Demucs)
-        model_dir,
+        model_dir.clone(),
         8, // CPU threads
     ).await?;
 
-    println!("{lrc}");
+    // Or supply explicit artist / title / prompt hints:
+    let lrc_seeded = to_lrc_with_metadata(
+        &audio_bytes,
+        "ja",
+        true,
+        Some("Kenji Kawai"),
+        Some("Making of a Cyborg"),
+        None,
+        model_dir,
+        8,
+    ).await?;
+
+    println!("{lrc_seeded}");
     Ok(())
 }
 ```

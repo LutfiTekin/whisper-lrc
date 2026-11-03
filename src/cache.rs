@@ -6,6 +6,7 @@ pub struct CacheKey {
     pub audio_hash: String,
     pub lang: String,
     pub isolate: bool,
+    pub prompt: Option<String>,
 }
 
 #[derive(Clone)]

@@ -15,6 +15,7 @@ pub struct Job {
     pub pcm: Vec<f32>,
     pub duration_secs: f64,
     pub lang: String,
+    pub prompt: Option<String>,
     pub response_tx: oneshot::Sender<Result<TranscriptionResult, String>>,
     pub cancel_token: CancellationToken,
 }
@@ -60,6 +61,7 @@ struct RunningJobInfo {
     duration_secs: f64,
     pcm: Vec<f32>,
     lang: String,
+    prompt: Option<String>,
     cancel_token: CancellationToken,
 }
 
@@ -87,6 +89,7 @@ impl PreemptiveQueue {
         pcm: Vec<f32>,
         duration_secs: f64,
         lang: String,
+        prompt: Option<String>,
     ) -> Result<oneshot::Receiver<Result<TranscriptionResult, String>>, String> {
         let mut heap = self.heap.lock().await;
 
@@ -103,6 +106,7 @@ impl PreemptiveQueue {
             pcm,
             duration_secs,
             lang,
+            prompt,
             response_tx: tx,
             cancel_token,
         };
@@ -181,20 +185,22 @@ pub fn start_worker_loop(
                     duration_secs: job.duration_secs,
                     pcm: job.pcm.clone(),
                     lang: job.lang.clone(),
+                    prompt: job.prompt.clone(),
                     cancel_token: job.cancel_token.clone(),
                 });
             }
 
             tracing::info!(
-                "Processing job id: {} ({:.1}s, lang: {})",
+                "Processing job id: {} ({:.1}s, lang: {}, prompt: {:?})",
                 job.id,
                 job.duration_secs,
-                job.lang
+                job.lang,
+                job.prompt
             );
 
             let cancel_token = job.cancel_token.clone();
             let res = tokio::select! {
-                r = transcriber.transcribe(&job.pcm, &job.lang) => Some(r),
+                r = transcriber.transcribe(&job.pcm, &job.lang, job.prompt.as_deref()) => Some(r),
                 _ = cancel_token.cancelled() => None,
             };
 
@@ -207,6 +213,7 @@ pub fn start_worker_loop(
                     pcm: job.pcm,
                     duration_secs: job.duration_secs,
                     lang: job.lang,
+                    prompt: job.prompt,
                     response_tx: job.response_tx,
                     cancel_token: CancellationToken::new(),
                 };
