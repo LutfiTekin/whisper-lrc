@@ -46,8 +46,8 @@ pub fn extract_audio_metadata(bytes: &[u8]) -> AudioMetadata {
             match tag.std_key {
                 Some(StandardTagKey::Artist)
                 | Some(StandardTagKey::AlbumArtist)
-                | Some(StandardTagKey::ArtistPerformer)
-                | Some(StandardTagKey::LeadArtistPerformerSoloist) => {
+                | Some(StandardTagKey::OriginalArtist)
+                | Some(StandardTagKey::Performer) => {
                     if artist.is_none() {
                         let val = tag.value.to_string().trim().to_string();
                         if !val.is_empty() {

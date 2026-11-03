@@ -23,12 +23,18 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 
 WORKDIR /usr/src/whisper-lrc
 
-# Copy manifests and source
+# Cache dependencies in a dedicated layer
 COPY Cargo.toml ./
-COPY src ./src
+RUN mkdir -p src && \
+    echo "" > src/lib.rs && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release --features cuda && \
+    rm -rf src
 
-# Build release binary with CUDA acceleration
-RUN cargo build --release --features cuda
+# Copy actual source and compile application crate
+COPY src ./src
+RUN touch src/lib.rs src/main.rs && \
+    cargo build --release --features cuda
 
 # ==============================================================================
 # Runtime Stage
