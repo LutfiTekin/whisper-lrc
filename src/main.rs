@@ -18,7 +18,7 @@ use whisper_lrc::audio::{
     apply_rms_silence_gate, decode_audio_to_16k_mono, extract_audio_metadata,
 };
 use whisper_lrc::cache::{CacheKey, LrcCache};
-use whisper_lrc::isolation::isolate_vocals;
+use whisper_lrc::isolation::isolate_vocals_to_16k_mono;
 use whisper_lrc::queue::{start_worker_loop, PreemptiveQueue};
 use whisper_lrc::transcriber::{build_initial_prompt, TranscriberService};
 
@@ -26,6 +26,7 @@ use whisper_lrc::transcriber::{build_initial_prompt, TranscriberService};
 struct AppState {
     queue: Arc<PreemptiveQueue>,
     cache: LrcCache,
+    model_dir: PathBuf,
 }
 
 #[derive(Deserialize, Default)]
@@ -87,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(32);
 
     tracing::info!("Initializing Whisper Transcriber Service...");
-    let transcriber = Arc::new(TranscriberService::new(model_dir, cpu_threads));
+    let transcriber = Arc::new(TranscriberService::new(model_dir.clone(), cpu_threads));
 
     tracing::info!("Starting Preemptive Priority Queue (Concurrency = 1)...");
     let queue = Arc::new(PreemptiveQueue::new(max_queue_capacity));
@@ -96,7 +97,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cache = LrcCache::new(cache_size, cache_ttl_secs);
 
-    let state = AppState { queue, cache };
+    let state = AppState {
+        queue,
+        cache,
+        model_dir,
+    };
 
     // Max 250MB audio upload limit
     let app = Router::new()
@@ -123,7 +128,7 @@ async fn handle_health() -> impl IntoResponse {
         "status": "healthy",
         "service": "whisper-lrc",
         "model": "ggml-large-v3-q5_0",
-        "vocal_isolation": "demucs-htdemucs",
+        "vocal_isolation": "demucs-rs-htdemucs",
         "hotlink_supported": true,
         "runtime": "rust-axum"
     }))
@@ -234,29 +239,27 @@ async fn process_audio_pipeline(
         }
     }
 
-    // 2. Vocal Isolation (Demucs) if enabled
-    let audio_to_decode = if isolate {
-        tracing::info!("Running Demucs vocal isolation on CPU...");
-        match isolate_vocals(&raw_bytes).await {
-            Ok(v) => v,
+    // 2. Vocal Isolation (pure-Rust demucs-rs) & Decode to 16kHz mono PCM
+    let mut decoded = if isolate {
+        match isolate_vocals_to_16k_mono(&raw_bytes, &state.model_dir).await {
+            Ok(d) => d,
             Err(e) => {
-                tracing::warn!("Demucs vocal isolation failed, continuing with mixed audio: {e}");
-                raw_bytes
+                tracing::warn!("demucs-rs vocal isolation failed, falling back to mixed audio: {e}");
+                tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&raw_bytes))
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?
             }
         }
     } else {
-        raw_bytes
+        tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&raw_bytes))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?
     };
 
-    // 3. Decode audio to 16kHz mono PCM, apply RMS silence gate, & get duration
-    let decoded = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let mut d = decode_audio_to_16k_mono(&audio_to_decode)?;
-        apply_rms_silence_gate(&mut d.pcm, 16000, -42.0);
-        Ok(d)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?;
+    // 3. Apply RMS silence gate to mute sustained instrumental/drum tails
+    apply_rms_silence_gate(&mut decoded.pcm, 16000, -42.0);
 
     // 4. Submit to Preemptive Priority Queue
     let rx = state

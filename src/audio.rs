@@ -12,6 +12,13 @@ pub struct DecodedAudio {
     pub duration_secs: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct StereoAudio {
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+    pub sample_rate: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AudioMetadata {
     pub artist: Option<String>,
@@ -114,8 +121,8 @@ pub fn apply_rms_silence_gate(pcm: &mut [f32], sample_rate: usize, threshold_db:
     }
 }
 
-/// Decodes audio bytes (MP3, WAV, FLAC, AAC, etc.) into 16,000 Hz mono f32 PCM.
-pub fn decode_audio_to_16k_mono(bytes: &[u8]) -> anyhow::Result<DecodedAudio> {
+/// Decodes audio bytes (MP3, WAV, FLAC, AAC, etc.) into stereo (left, right, sample_rate) f32 channels.
+pub fn decode_audio_to_stereo(bytes: &[u8]) -> anyhow::Result<StereoAudio> {
     let cursor = Cursor::new(bytes.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
@@ -141,7 +148,8 @@ pub fn decode_audio_to_16k_mono(bytes: &[u8]) -> anyhow::Result<DecodedAudio> {
     let dec_opts: DecoderOptions = Default::default();
     let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &dec_opts)?;
 
-    let mut mono_samples = Vec::new();
+    let mut left = Vec::new();
+    let mut right = Vec::new();
 
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
@@ -158,11 +166,12 @@ pub fn decode_audio_to_16k_mono(bytes: &[u8]) -> anyhow::Result<DecodedAudio> {
                 let samples = sample_buf.samples();
 
                 if channels == 1 {
-                    mono_samples.extend_from_slice(samples);
-                } else {
+                    left.extend_from_slice(samples);
+                    right.extend_from_slice(samples);
+                } else if channels >= 2 {
                     for chunk in samples.chunks(channels) {
-                        let sum: f32 = chunk.iter().sum();
-                        mono_samples.push(sum / (channels as f32));
+                        left.push(chunk[0]);
+                        right.push(chunk[1]);
                     }
                 }
             }
@@ -171,6 +180,25 @@ pub fn decode_audio_to_16k_mono(bytes: &[u8]) -> anyhow::Result<DecodedAudio> {
         }
     }
 
+    if left.is_empty() {
+        anyhow::bail!("Decoded audio contained 0 samples");
+    }
+
+    Ok(StereoAudio {
+        left,
+        right,
+        sample_rate,
+    })
+}
+
+/// Mixes stereo channels to mono and resamples to 16,000 Hz f32 PCM.
+pub fn stereo_to_16k_mono(left: &[f32], right: &[f32], sample_rate: u32) -> DecodedAudio {
+    let mono_samples: Vec<f32> = left
+        .iter()
+        .zip(right.iter())
+        .map(|(&l, &r)| (l + r) * 0.5)
+        .collect();
+
     let pcm = if sample_rate == 16000 {
         mono_samples
     } else {
@@ -178,8 +206,17 @@ pub fn decode_audio_to_16k_mono(bytes: &[u8]) -> anyhow::Result<DecodedAudio> {
     };
 
     let duration_secs = (pcm.len() as f64) / 16000.0;
+    DecodedAudio { pcm, duration_secs }
+}
 
-    Ok(DecodedAudio { pcm, duration_secs })
+/// Decodes audio bytes (MP3, WAV, FLAC, AAC, etc.) into 16,000 Hz mono f32 PCM.
+pub fn decode_audio_to_16k_mono(bytes: &[u8]) -> anyhow::Result<DecodedAudio> {
+    let stereo = decode_audio_to_stereo(bytes)?;
+    Ok(stereo_to_16k_mono(
+        &stereo.left,
+        &stereo.right,
+        stereo.sample_rate,
+    ))
 }
 
 pub fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {

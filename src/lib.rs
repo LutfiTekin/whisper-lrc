@@ -5,11 +5,11 @@ pub mod queue;
 pub mod transcriber;
 
 pub use audio::{
-    apply_rms_silence_gate, decode_audio_to_16k_mono, extract_audio_metadata, AudioMetadata,
-    DecodedAudio,
+    apply_rms_silence_gate, decode_audio_to_16k_mono, decode_audio_to_stereo,
+    extract_audio_metadata, stereo_to_16k_mono, AudioMetadata, DecodedAudio, StereoAudio,
 };
 pub use cache::{CacheKey, LrcCache};
-pub use isolation::isolate_vocals;
+pub use isolation::{isolate_vocals, isolate_vocals_to_16k_mono};
 pub use queue::PreemptiveQueue;
 pub use transcriber::{
     build_initial_prompt, format_lrc_timestamp, is_hallucination, LrcSegment, TranscriberService,
@@ -59,19 +59,18 @@ pub async fn to_lrc_with_metadata(
     let effective_title = title.or(embedded.title.as_deref());
     let initial_prompt = build_initial_prompt(effective_artist, effective_title, prompt);
 
-    let raw_to_decode = if isolate_vocals_first {
-        match isolate_vocals(audio_bytes).await {
-            Ok(v) => v,
+    let mut decoded = if isolate_vocals_first {
+        match isolate_vocals_to_16k_mono(audio_bytes, &model_dir).await {
+            Ok(d) => d,
             Err(e) => {
-                tracing::warn!("Vocal isolation failed, falling back to raw audio: {e}");
-                audio_bytes.to_vec()
+                tracing::warn!("demucs-rs vocal isolation failed, falling back to raw audio: {e}");
+                decode_audio_to_16k_mono(audio_bytes)?
             }
         }
     } else {
-        audio_bytes.to_vec()
+        decode_audio_to_16k_mono(audio_bytes)?
     };
 
-    let mut decoded = decode_audio_to_16k_mono(&raw_to_decode)?;
     apply_rms_silence_gate(&mut decoded.pcm, 16000, -42.0);
 
     let service = TranscriberService::new(model_dir, cpu_threads);

@@ -17,9 +17,9 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
   * When the queue is idle for 10 minutes, the model is evicted from VRAM/RAM (`cudaFree`), freeing resources for video transcoding or background tasks.
   * Reloads on-demand from SSD in $\sim$1.5s when a new track arrives.
 * **Direct Hotlink Streaming**: Accepts direct audio stream URLs (`GET /lyrics?url=...` or `POST`) and fetches audio on-the-fly, eliminating manual download/upload steps.
-* **Native Vocal Isolation (Demucs)**:
-  * Built-in multi-stem separator isolates pure singing phonemes from loud instruments before transcription.
-  * Eliminates acoustic distortion from drums, bass, and guitars for crystal-clear lyrics.
+* **Native Rust Vocal Isolation (`demucs-rs` / HTDemucs v4)**:
+  * Built-in pure-Rust multi-stem separator (`demucs-core` powered by the **Burn** deep learning framework) isolates pure singing phonemes from loud instruments in-memory before transcription—zero Python, PyTorch, or FFmpeg runtime dependencies required.
+  * Automatically downloads and caches `htdemucs.safetensors` ($\sim$84 MB) into `MODEL_DIR`.
 * **Multi-Layer Anti-Hallucination & Metadata Conditioning**:
   * **Auto-Prompting via Metadata (`artist`, `title`, `prompt`)**: Automatically extracts embedded ID3/Vorbis `Artist` and `TrackTitle` tags via `symphonia` (or uses request parameters) to seed Whisper's `initial_prompt`, preventing phonetic katakana fallback on archaic/stylized lyrics.
   * **RMS Vocal Silence Gate**: Mutes sustained non-vocal passages ($\ge 1.0\text{s}$ below $-42\text{ dBFS}$) to pure digital zero so instrumental percussion/bell outros never trigger phantom speech.
@@ -176,8 +176,7 @@ async fn main() -> anyhow::Result<()> {
 | :--- | :--- | :--- |
 | `PORT` | `9500` | Port for the HTTP server |
 | `HOST` | `0.0.0.0` | Bind address |
-| `MODEL_DIR` | `/models` | Directory where GGML models are cached |
-| `TORCH_HOME` | `/models/torch` | Directory where Demucs PyTorch models are cached |
+| `MODEL_DIR` | `/models` | Directory where Whisper GGML and Demucs `.safetensors` models are cached |
 | `CPU_THREADS` | `8` | Worker threads allocated for Demucs & CPU inference |
 | `IDLE_VRAM_TTL_SECS` | `600` | Inactivity seconds before dropping VRAM context (0 = keep forever) |
 | `MAX_QUEUE_CAPACITY` | `32` | Maximum queued jobs before returning HTTP 429 |

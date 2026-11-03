@@ -23,6 +23,12 @@ hex = "0.4"
 # Whisper.cpp Rust bindings
 whisper-rs = "0.14"
 
+# Native Rust HTDemucs v4 vocal isolation (Burn NdArray SIMD + multi-threaded CPU)
+demucs-core = { git = "https://github.com/nikhilunni/demucs-rs", features = ["ndarray"] }
+burn = { version = "0.20.1", default-features = false, features = ["std", "ndarray", "simd"] }
+burn-ndarray = { version = "0.20.1", features = ["simd", "multi-threads"] }
+pollster = "0.4"
+
 # Pure Rust audio decoding (MP3, WAV, FLAC, AAC, etc.)
 symphonia = { version = "0.5", features = ["all"] }
 
