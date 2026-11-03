@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(handle_health))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))
         .with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
