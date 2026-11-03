@@ -16,6 +16,7 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
 * **Idle VRAM/RAM Eviction (10-min TTL)**:
   * When the queue is idle for 10 minutes, the model is evicted from VRAM/RAM (`cudaFree`), freeing resources for video transcoding or background tasks.
   * Reloads on-demand from SSD in $\sim$1.5s when a new track arrives.
+* **Direct Hotlink Streaming**: Accepts direct audio stream URLs (`GET /lyrics?url=...` or `POST`) and fetches audio on-the-fly, eliminating manual download/upload steps.
 * **Native Vocal Isolation (Demucs)**:
   * Built-in multi-stem separator isolates pure singing phonemes from loud instruments before transcription.
   * Eliminates acoustic distortion from drums, bass, and guitars for crystal-clear lyrics.
@@ -66,6 +67,13 @@ curl -X POST "http://localhost:9500/lyrics" \
 curl -X POST "http://localhost:9500/lyrics" \
   -F "file=@song.mp3" \
   -F "lang=ja"
+```
+
+#### Example 3: Transcribe via JSON Body (`POST /lyrics/json`)
+```bash
+curl -X POST "http://localhost:9500/lyrics/json" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://listen.example.com/stream/track.mp3", "lang": "tr"}'
 ```
 
 **Output:**
