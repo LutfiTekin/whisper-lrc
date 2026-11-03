@@ -1,5 +1,6 @@
 services:
   whisper-lrc:
+    image: whisper-lrc:latest
     build: .
     container_name: whisper-lrc
     restart: unless-stopped

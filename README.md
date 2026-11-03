@@ -17,8 +17,8 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
   * When the queue is idle for 10 minutes, the model is evicted from VRAM/RAM (`cudaFree`), freeing resources for video transcoding or background tasks.
   * Reloads on-demand from SSD in $\sim$1.5s when a new track arrives.
 * **Dual Accuracy Levels**:
-  * `normal` *(default)*: Uses `medium` model with GPU/CUDA acceleration ($\sim$2.5 GB VRAM).
-  * `high`: Uses `large-v3` model on multi-threaded CPU for maximum precision.
+  * `normal` *(default)*: Uses `medium` model with GPU/CUDA acceleration ($\sim$1.5 GB VRAM).
+  * `high`: Uses `large-v3-turbo` model with GPU/CUDA acceleration ($\sim$1.6 GB VRAM) for state-of-the-art precision and fast inference.
 
 ---
 

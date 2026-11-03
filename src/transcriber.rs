@@ -76,7 +76,7 @@ impl TranscriberService {
     fn model_filename(&self, accuracy: Accuracy) -> &'static str {
         match accuracy {
             Accuracy::Normal => "ggml-medium.bin",
-            Accuracy::High => "ggml-large-v3.bin",
+            Accuracy::High => "ggml-large-v3-turbo.bin",
         }
     }
 
@@ -128,14 +128,7 @@ impl TranscriberService {
 
         tracing::info!("Loading {:?} into memory/VRAM...", accuracy);
         let mut ctx_params = WhisperContextParameters::default();
-        match accuracy {
-            Accuracy::Normal => {
-                ctx_params.use_gpu(true);
-            }
-            Accuracy::High => {
-                ctx_params.use_gpu(false);
-            }
-        }
+        ctx_params.use_gpu(true);
         let ctx = WhisperContext::new_with_params(path_str, ctx_params)
             .map_err(|e| anyhow::anyhow!("Failed initializing Whisper context: {e:?}"))?;
 
