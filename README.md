@@ -64,7 +64,6 @@ curl -X POST "http://localhost:9500/lyrics" \
 ```bash
 curl -X POST "http://localhost:9500/lyrics" \
   -F "file=@song.mp3" \
-  -F "accuracy=high" \
   -F "format=json" \
   -F "refresh=true"
 ```
@@ -95,7 +94,7 @@ whisper-lrc = { path = "../whisper-lrc" }
 
 ```rust
 use std::path::PathBuf;
-use whisper_lrc::{Accuracy, to_lrc};
+use whisper_lrc::to_lrc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -104,7 +103,6 @@ async fn main() -> anyhow::Result<()> {
 
     let lrc = to_lrc(
         &audio_bytes,
-        Accuracy::Normal,
         "ja",
         model_dir,
         8, // CPU threads

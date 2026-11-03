@@ -148,9 +148,6 @@ async fn handle_lyrics(
                     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid filepath field: {e}")))?;
                 filepath = Some(text.trim().to_string());
             }
-            "accuracy" => {
-                // Tier dropped: large-v3-q5_0 is used globally. Retained for backward-compat.
-            }
             "lang" => {
                 let text = field
                     .text()
