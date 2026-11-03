@@ -16,9 +16,9 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
 * **Idle VRAM/RAM Eviction (10-min TTL)**:
   * When the queue is idle for 10 minutes, the model is evicted from VRAM/RAM (`cudaFree`), freeing resources for video transcoding or background tasks.
   * Reloads on-demand from SSD in $\sim$1.5s when a new track arrives.
-* **Dual Accuracy Levels**:
-  * `normal` *(default)*: Uses `medium` model with GPU/CUDA acceleration ($\sim$1.5 GB VRAM).
-  * `high`: Uses `large-v3-turbo` model with GPU/CUDA acceleration ($\sim$1.6 GB VRAM) for state-of-the-art precision and fast inference.
+* **State-of-the-Art Whisper Model**:
+  * Powered by full 32-layer **`large-v3-q5_0`** (5-bit quantization, $\sim$1.08 GB).
+  * Runs 100% on GPU (CUDA) using only $\sim$1.4 GB VRAM for maximum accuracy and fast inference.
 
 ---
 
@@ -41,8 +41,7 @@ Accepts an uploaded audio file or server-local file path.
 **Multipart Form Parameters:**
 * `file`: Audio file binary (MP3, WAV, FLAC, AAC)
 * `filepath`: Server-local file path (optional zero-copy alternative to upload)
-* `accuracy`: `normal` (default) or `high`
-* `lang`: Language code, e.g. `ja` (default), `en`, or `auto`
+* `lang`: Language code, e.g. `ja` (default), `en`, `tr`, or `auto`
 * `format`: `lrc` (default, returns `text/plain`) or `json`
 * `refresh`: `false` (default) or `true` (forces fresh inference, bypassing cache)
 
@@ -50,7 +49,6 @@ Accepts an uploaded audio file or server-local file path.
 ```bash
 curl -X POST "http://localhost:9500/lyrics" \
   -F "file=@song.mp3" \
-  -F "accuracy=normal" \
   -F "lang=ja"
 ```
 

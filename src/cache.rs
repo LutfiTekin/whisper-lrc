@@ -1,13 +1,9 @@
 use moka::future::Cache;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
-
-use crate::transcriber::Accuracy;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CacheKey {
     pub audio_hash: String,
-    pub accuracy: Accuracy,
     pub lang: String,
 }
 

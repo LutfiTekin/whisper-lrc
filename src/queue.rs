@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::transcriber::{Accuracy, TranscriberService, TranscriptionResult};
+use crate::transcriber::{TranscriberService, TranscriptionResult};
 
 pub const DEFAULT_LONG_AUDIO_THRESHOLD: f64 = 600.0; // 10 minutes
 
@@ -14,7 +14,6 @@ pub struct Job {
     pub id: u64,
     pub pcm: Vec<f32>,
     pub duration_secs: f64,
-    pub accuracy: Accuracy,
     pub lang: String,
     pub response_tx: oneshot::Sender<Result<TranscriptionResult, String>>,
     pub cancel_token: CancellationToken,
@@ -60,9 +59,7 @@ struct RunningJobInfo {
     id: u64,
     duration_secs: f64,
     pcm: Vec<f32>,
-    accuracy: Accuracy,
     lang: String,
-    response_tx: Option<oneshot::Sender<Result<TranscriptionResult, String>>>,
     cancel_token: CancellationToken,
 }
 
@@ -89,7 +86,6 @@ impl PreemptiveQueue {
         &self,
         pcm: Vec<f32>,
         duration_secs: f64,
-        accuracy: Accuracy,
         lang: String,
     ) -> Result<oneshot::Receiver<Result<TranscriptionResult, String>>, String> {
         let mut heap = self.heap.lock().await;
@@ -106,7 +102,6 @@ impl PreemptiveQueue {
             id,
             pcm,
             duration_secs,
-            accuracy,
             lang,
             response_tx: tx,
             cancel_token,
@@ -185,24 +180,21 @@ pub fn start_worker_loop(
                     id: job.id,
                     duration_secs: job.duration_secs,
                     pcm: job.pcm.clone(),
-                    accuracy: job.accuracy,
                     lang: job.lang.clone(),
-                    response_tx: None,
                     cancel_token: job.cancel_token.clone(),
                 });
             }
 
             tracing::info!(
-                "Processing job id: {} ({:.1}s, {:?}, lang: {})",
+                "Processing job id: {} ({:.1}s, lang: {})",
                 job.id,
                 job.duration_secs,
-                job.accuracy,
                 job.lang
             );
 
             let cancel_token = job.cancel_token.clone();
             let res = tokio::select! {
-                r = transcriber.transcribe(&job.pcm, job.accuracy, &job.lang) => Some(r),
+                r = transcriber.transcribe(&job.pcm, &job.lang) => Some(r),
                 _ = cancel_token.cancelled() => None,
             };
 
@@ -214,7 +206,6 @@ pub fn start_worker_loop(
                     id: job.id,
                     pcm: job.pcm,
                     duration_secs: job.duration_secs,
-                    accuracy: job.accuracy,
                     lang: job.lang,
                     response_tx: job.response_tx,
                     cancel_token: CancellationToken::new(),

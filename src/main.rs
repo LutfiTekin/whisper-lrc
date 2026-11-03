@@ -1,15 +1,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use axum::{
-    extract::{Multipart, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
-};
+use axum::extract::{DefaultBodyLimit, Multipart, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tower_http::cors::CorsLayer;
@@ -19,7 +16,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use whisper_lrc::audio::decode_audio_to_16k_mono;
 use whisper_lrc::cache::{CacheKey, LrcCache};
 use whisper_lrc::queue::{start_worker_loop, PreemptiveQueue};
-use whisper_lrc::transcriber::{Accuracy, TranscriberService};
+use whisper_lrc::transcriber::TranscriberService;
 
 #[derive(Clone)]
 struct AppState {
@@ -43,48 +40,58 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(9500);
 
-    let model_dir = PathBuf::from(std::env::var("MODEL_DIR").unwrap_or_else(|_| "/models".to_string()));
+    let model_dir = PathBuf::from(
+        std::env::var("MODEL_DIR").unwrap_or_else(|_| "/models".to_string()),
+    );
     let cpu_threads: i32 = std::env::var("CPU_THREADS")
         .unwrap_or_else(|_| "8".to_string())
         .parse()
         .unwrap_or(8);
 
-    let idle_ttl_secs: u64 = std::env::var("IDLE_TIMEOUT_SECS")
+    let cache_size: u64 = std::env::var("CACHE_SIZE")
+        .unwrap_or_else(|_| "500".to_string())
+        .parse()
+        .unwrap_or(500);
+
+    let cache_ttl_secs: u64 = std::env::var("CACHE_TTL_SECS")
+        .unwrap_or_else(|_| "86400".to_string())
+        .parse()
+        .unwrap_or(86400);
+
+    let idle_vram_ttl_secs: u64 = std::env::var("IDLE_VRAM_TTL_SECS")
         .unwrap_or_else(|_| "600".to_string())
         .parse()
         .unwrap_or(600);
 
     let max_queue_capacity: usize = std::env::var("MAX_QUEUE_CAPACITY")
-        .unwrap_or_else(|_| "100".to_string())
+        .unwrap_or_else(|_| "32".to_string())
         .parse()
-        .unwrap_or(100);
+        .unwrap_or(32);
 
-    let cache_capacity: u64 = std::env::var("CACHE_CAPACITY")
-        .unwrap_or_else(|_| "5000".to_string())
-        .parse()
-        .unwrap_or(5000);
-
+    tracing::info!("Initializing Whisper Transcriber Service...");
     let transcriber = Arc::new(TranscriberService::new(model_dir, cpu_threads));
-    let queue = Arc::new(PreemptiveQueue::new(max_queue_capacity));
-    let cache = LrcCache::new(cache_capacity, 0); // 0 = no expiration until evicted by LRU
 
-    // Start background single-concurrency worker loop
-    start_worker_loop(queue.clone(), transcriber, idle_ttl_secs);
+    tracing::info!("Starting Preemptive Priority Queue (Concurrency = 1)...");
+    let queue = Arc::new(PreemptiveQueue::new(max_queue_capacity));
+
+    start_worker_loop(queue.clone(), transcriber.clone(), idle_vram_ttl_secs);
+
+    let cache = LrcCache::new(cache_size, cache_ttl_secs);
 
     let state = AppState { queue, cache };
 
+    // Max 250MB audio upload limit
     let app = Router::new()
-        .route("/lyrics", post(handle_lyrics))
-        .route("/queue", get(handle_queue))
         .route("/health", get(handle_health))
+        .route("/queue", get(handle_queue_status))
+        .route("/lyrics", post(handle_lyrics))
+        .layer(DefaultBodyLimit::max(250 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))
         .with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    tracing::info!("Whisper LRC Rust microservice listening on http://{addr}");
-    tracing::info!("Preemptive queue active. Idle VRAM eviction TTL: {}s", idle_ttl_secs);
+    tracing::info!("Whisper LRC server listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -96,15 +103,16 @@ async fn handle_health() -> impl IntoResponse {
     Json(json!({
         "status": "healthy",
         "service": "whisper-lrc",
+        "model": "ggml-large-v3-q5_0",
         "runtime": "rust-axum"
     }))
 }
 
-async fn handle_queue(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_queue_status(State(state): State<AppState>) -> impl IntoResponse {
     let q_status = state.queue.status().await;
     Json(json!({
         "queue": q_status,
-        "cached_tracks": state.cache.entry_count()
+        "cached_entries": state.cache.entry_count()
     }))
 }
 
@@ -114,7 +122,6 @@ async fn handle_lyrics(
 ) -> Result<Response, (StatusCode, String)> {
     let mut audio_bytes: Option<Vec<u8>> = None;
     let mut filepath: Option<String> = None;
-    let mut accuracy = Accuracy::Normal;
     let mut lang = "ja".to_string();
     let mut output_format = "lrc".to_string();
     let mut refresh = false;
@@ -142,13 +149,7 @@ async fn handle_lyrics(
                 filepath = Some(text.trim().to_string());
             }
             "accuracy" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid accuracy field: {e}")))?;
-                if let Ok(acc) = Accuracy::from_str(&text) {
-                    accuracy = acc;
-                }
+                // Tier dropped: large-v3-q5_0 is used globally. Retained for backward-compat.
             }
             "lang" => {
                 let text = field
@@ -198,7 +199,6 @@ async fn handle_lyrics(
 
     let cache_key = CacheKey {
         audio_hash: audio_hash.clone(),
-        accuracy,
         lang: lang.clone(),
     };
 
@@ -211,7 +211,6 @@ async fn handle_lyrics(
                     [(header::HeaderName::from_static("x-cache"), "HIT")],
                     Json(json!({
                         "lrc": cached_lrc,
-                        "accuracy": accuracy,
                         "lang": lang,
                         "cached": true
                     })),
@@ -240,7 +239,7 @@ async fn handle_lyrics(
     // 3. Submit to Preemptive Priority Queue
     let rx = state
         .queue
-        .submit(decoded.pcm, decoded.duration_secs, accuracy, lang.clone())
+        .submit(decoded.pcm, decoded.duration_secs, lang.clone())
         .await
         .map_err(|e| (StatusCode::TOO_MANY_REQUESTS, e))?;
 

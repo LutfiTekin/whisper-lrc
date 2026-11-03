@@ -6,30 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Accuracy {
-    Normal,
-    High,
-}
-
-impl Default for Accuracy {
-    fn default() -> Self {
-        Accuracy::Normal
-    }
-}
-
-impl std::str::FromStr for Accuracy {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "normal" => Ok(Accuracy::Normal),
-            "high" => Ok(Accuracy::High),
-            other => anyhow::bail!("Invalid accuracy '{other}'. Allowed: 'normal', 'high'."),
-        }
-    }
-}
+pub const DEFAULT_MODEL_FILENAME: &str = "ggml-large-v3-q5_0.bin";
 
 pub fn format_lrc_timestamp(seconds: f64) -> String {
     let s = if seconds < 0.0 { 0.0 } else { seconds };
@@ -49,7 +26,6 @@ pub struct LrcSegment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionResult {
     pub lrc: String,
-    pub accuracy: Accuracy,
     pub lang: String,
     pub segments: Vec<LrcSegment>,
 }
@@ -57,8 +33,7 @@ pub struct TranscriptionResult {
 pub struct TranscriberService {
     model_dir: PathBuf,
     cpu_threads: i32,
-    normal_context: Arc<Mutex<Option<Arc<WhisperContext>>>>,
-    high_context: Arc<Mutex<Option<Arc<WhisperContext>>>>,
+    context: Arc<Mutex<Option<Arc<WhisperContext>>>>,
     last_used: Arc<Mutex<Instant>>,
 }
 
@@ -67,22 +42,13 @@ impl TranscriberService {
         Self {
             model_dir,
             cpu_threads,
-            normal_context: Arc::new(Mutex::new(None)),
-            high_context: Arc::new(Mutex::new(None)),
+            context: Arc::new(Mutex::new(None)),
             last_used: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
-    fn model_filename(&self, accuracy: Accuracy) -> &'static str {
-        match accuracy {
-            Accuracy::Normal => "ggml-medium.bin",
-            Accuracy::High => "ggml-large-v3-turbo.bin",
-        }
-    }
-
-    async fn ensure_model(&self, accuracy: Accuracy) -> Result<PathBuf> {
-        let filename = self.model_filename(accuracy);
-        let path = self.model_dir.join(filename);
+    async fn ensure_model(&self) -> Result<PathBuf> {
+        let path = self.model_dir.join(DEFAULT_MODEL_FILENAME);
 
         if path.exists() {
             return Ok(path);
@@ -90,10 +56,14 @@ impl TranscriberService {
 
         tokio::fs::create_dir_all(&self.model_dir).await?;
 
-        tracing::info!("Model {} not found. Downloading to {:?}...", filename, path);
+        tracing::info!(
+            "Model {} not found. Downloading to {:?}...",
+            DEFAULT_MODEL_FILENAME,
+            path
+        );
         let url = format!(
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
-            filename
+            DEFAULT_MODEL_FILENAME
         );
 
         let resp = reqwest::get(&url)
@@ -101,21 +71,21 @@ impl TranscriberService {
             .context(format!("Failed to request model from {url}"))?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("Failed downloading model {filename}: HTTP {}", resp.status());
+            anyhow::bail!(
+                "Failed downloading model {DEFAULT_MODEL_FILENAME}: HTTP {}",
+                resp.status()
+            );
         }
 
         let bytes = resp.bytes().await?;
         tokio::fs::write(&path, &bytes).await?;
-        tracing::info!("Model {} downloaded successfully.", filename);
+        tracing::info!("Model {} downloaded successfully.", DEFAULT_MODEL_FILENAME);
 
         Ok(path)
     }
 
-    async fn get_or_load_context(&self, accuracy: Accuracy) -> Result<Arc<WhisperContext>> {
-        let mut guard = match accuracy {
-            Accuracy::Normal => self.normal_context.lock().await,
-            Accuracy::High => self.high_context.lock().await,
-        };
+    async fn get_or_load_context(&self) -> Result<Arc<WhisperContext>> {
+        let mut guard = self.context.lock().await;
 
         *self.last_used.lock().await = Instant::now();
 
@@ -123,10 +93,10 @@ impl TranscriberService {
             return Ok(ctx.clone());
         }
 
-        let model_path = self.ensure_model(accuracy).await?;
+        let model_path = self.ensure_model().await?;
         let path_str = model_path.to_str().context("Invalid UTF-8 in path")?;
 
-        tracing::info!("Loading {:?} into memory/VRAM...", accuracy);
+        tracing::info!("Loading large-v3-q5_0 into GPU VRAM (CUDA)...");
         let mut ctx_params = WhisperContextParameters::default();
         ctx_params.use_gpu(true);
         let ctx = WhisperContext::new_with_params(path_str, ctx_params)
@@ -137,7 +107,7 @@ impl TranscriberService {
         Ok(arc_ctx)
     }
 
-    /// Evicts loaded models from VRAM and RAM if idle time exceeds ttl_secs.
+    /// Evicts loaded model from VRAM if idle time exceeds ttl_secs.
     pub async fn evict_if_idle(&self, ttl_secs: u64) -> bool {
         if ttl_secs == 0 {
             return false;
@@ -145,16 +115,14 @@ impl TranscriberService {
 
         let last = *self.last_used.lock().await;
         if last.elapsed().as_secs() >= ttl_secs {
-            let mut normal_guard = self.normal_context.lock().await;
-            let mut high_guard = self.high_context.lock().await;
+            let mut guard = self.context.lock().await;
 
-            if normal_guard.is_some() || high_guard.is_some() {
+            if guard.is_some() {
                 tracing::info!(
-                    "Idle TTL ({}s) reached. Evicting models from VRAM and RAM.",
+                    "Idle TTL ({}s) reached. Evicting model from GPU VRAM.",
                     ttl_secs
                 );
-                *normal_guard = None;
-                *high_guard = None;
+                *guard = None;
                 return true;
             }
         }
@@ -164,10 +132,9 @@ impl TranscriberService {
     pub async fn transcribe(
         &self,
         pcm_16k_mono: &[f32],
-        accuracy: Accuracy,
         lang: &str,
     ) -> Result<TranscriptionResult> {
-        let ctx = self.get_or_load_context(accuracy).await?;
+        let ctx = self.get_or_load_context().await?;
         let mut state = ctx
             .create_state()
             .map_err(|e| anyhow::anyhow!("Failed to create Whisper state: {e:?}"))?;
@@ -233,7 +200,6 @@ impl TranscriberService {
 
         Ok(TranscriptionResult {
             lrc: lrc_output,
-            accuracy,
             lang: lang_clean,
             segments,
         })
