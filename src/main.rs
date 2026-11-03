@@ -2,11 +2,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tower_http::cors::CorsLayer;
@@ -23,6 +24,17 @@ use whisper_lrc::transcriber::TranscriberService;
 struct AppState {
     queue: Arc<PreemptiveQueue>,
     cache: LrcCache,
+}
+
+#[derive(Deserialize, Default)]
+struct LyricsQuery {
+    url: Option<String>,
+    hotlink: Option<String>,
+    filepath: Option<String>,
+    lang: Option<String>,
+    isolate: Option<bool>,
+    format: Option<String>,
+    refresh: Option<bool>,
 }
 
 #[tokio::main]
@@ -85,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/queue", get(handle_queue_status))
-        .route("/lyrics", post(handle_lyrics))
+        .route("/lyrics", post(handle_lyrics_multipart).get(handle_lyrics_query))
+        .route("/lyrics/json", post(handle_lyrics_json))
         .layer(DefaultBodyLimit::max(250 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -106,6 +119,7 @@ async fn handle_health() -> impl IntoResponse {
         "service": "whisper-lrc",
         "model": "ggml-large-v3-q5_0",
         "vocal_isolation": "demucs-htdemucs",
+        "hotlink_supported": true,
         "runtime": "rust-axum"
     }))
 }
@@ -118,87 +132,43 @@ async fn handle_queue_status(State(state): State<AppState>) -> impl IntoResponse
     }))
 }
 
-async fn handle_lyrics(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> Result<Response, (StatusCode, String)> {
-    let mut audio_bytes: Option<Vec<u8>> = None;
-    let mut filepath: Option<String> = None;
-    let mut lang = "ja".to_string();
-    let mut output_format = "lrc".to_string();
-    let mut refresh = false;
-    let mut isolate = true; // Default to true for crystal-clear lyrics
+async fn fetch_hotlink_audio(url: &str) -> Result<Vec<u8>, (StatusCode, String)> {
+    tracing::info!("Fetching hotlink audio from URL: {url}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("HTTP client error: {e}")))?;
 
-    while let Some(field) = multipart
-        .next_field()
+    let resp = client
+        .get(url)
+        .send()
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
-    {
-        let name = field.name().unwrap_or_default().to_string();
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed fetching hotlink URL: {e}")))?;
 
-        match name.as_str() {
-            "file" => {
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed reading file: {e}")))?;
-                audio_bytes = Some(data.to_vec());
-            }
-            "filepath" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid filepath field: {e}")))?;
-                filepath = Some(text.trim().to_string());
-            }
-            "isolate" | "isolate_vocals" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid isolate field: {e}")))?;
-                isolate = !text.trim().eq_ignore_ascii_case("false") && text.trim() != "0";
-            }
-            "lang" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid lang field: {e}")))?;
-                lang = text.trim().to_string();
-            }
-            "format" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid format field: {e}")))?;
-                output_format = text.trim().to_lowercase();
-            }
-            "refresh" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid refresh field: {e}")))?;
-                refresh = text.trim().eq_ignore_ascii_case("true") || text.trim() == "1";
-            }
-            _ => (),
-        }
+    if !resp.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Hotlink URL returned status HTTP {}", resp.status()),
+        ));
     }
 
-    let raw_bytes = if let Some(bytes) = audio_bytes {
-        bytes
-    } else if let Some(path_str) = filepath {
-        tokio::fs::read(&path_str).await.map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Failed reading file at '{path_str}': {e}"),
-            )
-        })?
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Provide either 'file' upload or 'filepath' form field.".to_string(),
-        ));
-    };
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed reading hotlink stream: {e}")))?;
 
+    tracing::info!("Fetched hotlink audio ({} bytes).", bytes.len());
+    Ok(bytes.to_vec())
+}
+
+async fn process_audio_pipeline(
+    state: &AppState,
+    raw_bytes: Vec<u8>,
+    lang: String,
+    isolate: bool,
+    output_format: String,
+    refresh: bool,
+) -> Result<Response, (StatusCode, String)> {
     // Calculate SHA-256 hash for in-memory LRU cache
     let mut hasher = Sha256::new();
     hasher.update(&raw_bytes);
@@ -293,4 +263,155 @@ async fn handle_lyrics(
         )
             .into_response())
     }
+}
+
+async fn handle_lyrics_multipart(
+    State(state): State<AppState>,
+    Query(query): Query<LyricsQuery>,
+    mut multipart: Multipart,
+) -> Result<Response, (StatusCode, String)> {
+    let mut audio_bytes: Option<Vec<u8>> = None;
+    let mut filepath = query.filepath;
+    let mut hotlink_url = query.url.or(query.hotlink);
+    let mut lang = query.lang.unwrap_or_else(|| "ja".to_string());
+    let mut output_format = query.format.unwrap_or_else(|| "lrc".to_string());
+    let mut refresh = query.refresh.unwrap_or(false);
+    let mut isolate = query.isolate.unwrap_or(true);
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+
+        match name.as_str() {
+            "file" => {
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed reading file: {e}")))?;
+                audio_bytes = Some(data.to_vec());
+            }
+            "url" | "hotlink" | "link" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid url field: {e}")))?;
+                hotlink_url = Some(text.trim().to_string());
+            }
+            "filepath" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid filepath field: {e}")))?;
+                filepath = Some(text.trim().to_string());
+            }
+            "isolate" | "isolate_vocals" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid isolate field: {e}")))?;
+                isolate = !text.trim().eq_ignore_ascii_case("false") && text.trim() != "0";
+            }
+            "lang" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid lang field: {e}")))?;
+                lang = text.trim().to_string();
+            }
+            "format" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid format field: {e}")))?;
+                output_format = text.trim().to_lowercase();
+            }
+            "refresh" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid refresh field: {e}")))?;
+                refresh = text.trim().eq_ignore_ascii_case("true") || text.trim() == "1";
+            }
+            _ => (),
+        }
+    }
+
+    let raw_bytes = if let Some(bytes) = audio_bytes {
+        bytes
+    } else if let Some(url) = hotlink_url {
+        fetch_hotlink_audio(&url).await?
+    } else if let Some(path_str) = filepath {
+        tokio::fs::read(&path_str).await.map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Failed reading file at '{path_str}': {e}"),
+            )
+        })?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide 'file' upload, 'url' hotlink, or 'filepath' form field.".to_string(),
+        ));
+    };
+
+    process_audio_pipeline(&state, raw_bytes, lang, isolate, output_format, refresh).await
+}
+
+async fn handle_lyrics_query(
+    State(state): State<AppState>,
+    Query(query): Query<LyricsQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let lang = query.lang.unwrap_or_else(|| "ja".to_string());
+    let output_format = query.format.unwrap_or_else(|| "lrc".to_string()).to_lowercase();
+    let refresh = query.refresh.unwrap_or(false);
+    let isolate = query.isolate.unwrap_or(true);
+
+    let raw_bytes = if let Some(url) = query.url.or(query.hotlink) {
+        fetch_hotlink_audio(&url).await?
+    } else if let Some(path_str) = query.filepath {
+        tokio::fs::read(&path_str).await.map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Failed reading file at '{path_str}': {e}"),
+            )
+        })?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide 'url' or 'filepath' query parameter.".to_string(),
+        ));
+    };
+
+    process_audio_pipeline(&state, raw_bytes, lang, isolate, output_format, refresh).await
+}
+
+async fn handle_lyrics_json(
+    State(state): State<AppState>,
+    Json(payload): Json<LyricsQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let lang = payload.lang.unwrap_or_else(|| "ja".to_string());
+    let output_format = payload.format.unwrap_or_else(|| "lrc".to_string()).to_lowercase();
+    let refresh = payload.refresh.unwrap_or(false);
+    let isolate = payload.isolate.unwrap_or(true);
+
+    let raw_bytes = if let Some(url) = payload.url.or(payload.hotlink) {
+        fetch_hotlink_audio(&url).await?
+    } else if let Some(path_str) = payload.filepath {
+        tokio::fs::read(&path_str).await.map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Failed reading file at '{path_str}': {e}"),
+            )
+        })?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide 'url' or 'filepath' in JSON payload.".to_string(),
+        ));
+    };
+
+    process_audio_pipeline(&state, raw_bytes, lang, isolate, output_format, refresh).await
 }

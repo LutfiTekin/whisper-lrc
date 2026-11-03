@@ -37,19 +37,31 @@ The service will start listening on port `9500`.
 
 ### Endpoints
 
-#### `POST /lyrics`
+#### `POST /lyrics` & `GET /lyrics`
 
-Accepts an uploaded audio file or server-local file path.
+Accepts an uploaded audio file, server-local file path, or **hotlink audio stream URL**.
 
-**Multipart Form Parameters:**
-* `file`: Audio file binary (MP3, WAV, FLAC, AAC)
+**Parameters (Multipart Form, Query Params, or JSON):**
+* `file`: Audio file binary upload (MP3, WAV, FLAC, AAC)
+* `url`: Direct hotlink / streaming audio URL (e.g. `https://listen.example.com/stream/...`)
 * `filepath`: Server-local file path (optional zero-copy alternative to upload)
 * `lang`: Language code, e.g. `ja` (default), `en`, `tr`, or `auto`
 * `isolate`: `true` (default) or `false` (skips vocal isolation for podcasts or speech)
 * `format`: `lrc` (default, returns `text/plain`) or `json`
 * `refresh`: `false` (default) or `true` (forces fresh inference, bypassing cache)
 
-#### Example: Transcribe to Synced LRC
+#### Example 1: Transcribe via Direct Hotlink URL (GET or POST)
+```bash
+# Simple GET request with URL query parameter
+curl "http://localhost:9500/lyrics?url=https://listen.example.com/stream/track.mp3&lang=tr"
+
+# Or via POST multipart form
+curl -X POST "http://localhost:9500/lyrics" \
+  -F "url=https://listen.example.com/stream/track.mp3" \
+  -F "lang=tr"
+```
+
+#### Example 2: Transcribe via File Upload
 ```bash
 curl -X POST "http://localhost:9500/lyrics" \
   -F "file=@song.mp3" \
