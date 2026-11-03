@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     let lrc = to_lrc(
         &audio_bytes,
         "ja",
+        true, // isolate_vocals_first (via Demucs)
         model_dir,
         8, // CPU threads
     ).await?;
@@ -124,8 +125,11 @@ async fn main() -> anyhow::Result<()> {
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` | `9500` | Port for the HTTP server |
+| `HOST` | `0.0.0.0` | Bind address |
 | `MODEL_DIR` | `/models` | Directory where GGML models are cached |
-| `CPU_THREADS` | `8` | Worker threads allocated for CPU inference |
-| `IDLE_TIMEOUT_SECS` | `600` | Inactivity seconds before dropping VRAM/RAM context (0 = keep forever) |
-| `MAX_QUEUE_CAPACITY`| `100` | Maximum queued jobs before returning HTTP 429 |
-| `CACHE_CAPACITY` | `5000` | Max entries in the in-memory LRU cache |
+| `TORCH_HOME` | `/models/torch` | Directory where Demucs PyTorch models are cached |
+| `CPU_THREADS` | `8` | Worker threads allocated for Demucs & CPU inference |
+| `IDLE_VRAM_TTL_SECS` | `600` | Inactivity seconds before dropping VRAM context (0 = keep forever) |
+| `MAX_QUEUE_CAPACITY` | `32` | Maximum queued jobs before returning HTTP 429 |
+| `CACHE_SIZE` | `500` | Max entries in the in-memory LRU cache |
+| `CACHE_TTL_SECS` | `86400` | Expiration time for cached lyrics (24 hours) |
