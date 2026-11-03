@@ -127,7 +127,15 @@ impl TranscriberService {
         let path_str = model_path.to_str().context("Invalid UTF-8 in path")?;
 
         tracing::info!("Loading {:?} into memory/VRAM...", accuracy);
-        let ctx_params = WhisperContextParameters::default();
+        let mut ctx_params = WhisperContextParameters::default();
+        match accuracy {
+            Accuracy::Normal => {
+                ctx_params.use_gpu(true);
+            }
+            Accuracy::High => {
+                ctx_params.use_gpu(false);
+            }
+        }
         let ctx = WhisperContext::new_with_params(path_str, ctx_params)
             .map_err(|e| anyhow::anyhow!("Failed initializing Whisper context: {e:?}"))?;
 
