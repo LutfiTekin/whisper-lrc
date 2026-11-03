@@ -20,6 +20,6 @@ pub async fn to_lrc(
 ) -> anyhow::Result<String> {
     let decoded = decode_audio_to_16k_mono(audio_bytes)?;
     let service = TranscriberService::new(model_dir, cpu_threads);
-    let result = service.transcribe(&decoded.pcm, accuracy, lang, None).await?;
+    let result = service.transcribe(&decoded.pcm, accuracy, lang).await?;
     Ok(result.lrc)
 }

@@ -200,17 +200,15 @@ pub fn start_worker_loop(
                 job.lang
             );
 
-            let res = transcriber
-                .transcribe(
-                    &job.pcm,
-                    job.accuracy,
-                    &job.lang,
-                    Some(job.cancel_token.clone()),
-                )
-                .await;
+            let cancel_token = job.cancel_token.clone();
+            let res = tokio::select! {
+                r = transcriber.transcribe(&job.pcm, job.accuracy, &job.lang) => Some(r),
+                _ = cancel_token.cancelled() => None,
+            };
 
-            // Check if cancelled by preemption
-            if job.cancel_token.is_cancelled() {
+            if let Some(r) = res {
+                let _ = job.response_tx.send(r.map_err(|e| e.to_string()));
+            } else {
                 tracing::info!("Job id: {} was preempted. Re-queuing to heap.", job.id);
                 let re_queued = Job {
                     id: job.id,
@@ -223,8 +221,6 @@ pub fn start_worker_loop(
                 };
                 let mut heap = queue.heap.lock().await;
                 heap.push(re_queued);
-            } else {
-                let _ = job.response_tx.send(res.map_err(|e| e.to_string()));
             }
 
             // Clear active job

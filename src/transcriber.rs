@@ -1,11 +1,9 @@
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -167,7 +165,6 @@ impl TranscriberService {
         pcm_16k_mono: &[f32],
         accuracy: Accuracy,
         lang: &str,
-        cancel_token: Option<CancellationToken>,
     ) -> Result<TranscriptionResult> {
         let ctx = self.get_or_load_context(accuracy).await?;
         let mut state = ctx
@@ -190,27 +187,9 @@ impl TranscriberService {
             params.set_language(None);
         }
 
-        // Cooperative cancellation check
-        let is_aborted = Arc::new(AtomicBool::new(false));
-        let abort_flag = is_aborted.clone();
-
-        if let Some(token) = cancel_token {
-            tokio::spawn(async move {
-                token.cancelled().await;
-                abort_flag.store(true, Ordering::SeqCst);
-            });
-        }
-
-        let abort_checker = is_aborted.clone();
-        params.set_abort_callback(Some(move |_| abort_checker.load(Ordering::SeqCst)));
-
         state
             .full(params, pcm_16k_mono)
             .map_err(|e| anyhow::anyhow!("Whisper inference error: {e:?}"))?;
-
-        if is_aborted.load(Ordering::SeqCst) {
-            anyhow::bail!("Inference was cancelled by preemption");
-        }
 
         let num_segments = state
             .full_n_segments()
