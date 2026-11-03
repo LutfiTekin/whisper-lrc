@@ -1,0 +1,27 @@
+services:
+  whisper-lrc:
+    build: .
+    container_name: whisper-lrc
+    restart: unless-stopped
+    ports:
+      - "${PORT:-9500}:9500"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - MODEL_DIR=/models
+      - CPU_THREADS=${CPU_THREADS:-8}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      # Persistent cache for downloaded GGML models (ggml-medium.bin, ggml-large-v3.bin)
+      - whisper_models:/models
+      # Optional read-only mount for media storage if passing local file paths directly
+      # - /path/to/music:/media/music:ro
+
+volumes:
+  whisper_models:
