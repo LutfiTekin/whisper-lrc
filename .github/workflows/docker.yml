@@ -23,3 +23,7 @@ jobs:
           load: true
           push: false
           tags: whisper-lrc:latest
+
+      - name: Deploy container on main
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: docker compose up -d --no-build --force-recreate
