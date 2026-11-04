@@ -294,7 +294,7 @@ impl TranscriberService {
         params.set_logprob_thold(-1.0);
         params.set_entropy_thold(2.4);
         params.set_temperature(0.0);
-        params.set_temperature_inc(0.2);
+        params.set_temperature_inc(0.0);
 
         let clean_prompt = prompt
             .map(|p| p.replace('\0', "").trim().to_string())
@@ -312,13 +312,21 @@ impl TranscriberService {
             params.set_language(None);
         }
 
+        let t0 = Instant::now();
         state
             .full(params, pcm_16k_mono)
             .map_err(|e| anyhow::anyhow!("Whisper inference error: {e:?}"))?;
+        let inference_dur = t0.elapsed();
 
         let num_segments = state
             .full_n_segments()
             .map_err(|e| anyhow::anyhow!("Failed reading segment count: {e:?}"))?;
+
+        tracing::info!(
+            "Whisper inference finished in {:.2?} (raw segments: {})",
+            inference_dur,
+            num_segments
+        );
 
         let mut segments = Vec::new();
         let mut lrc_lines = Vec::new();

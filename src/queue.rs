@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -190,6 +190,7 @@ pub fn start_worker_loop(
                 });
             }
 
+            let job_start = Instant::now();
             tracing::info!(
                 "Processing job id: {} ({:.1}s, lang: {}, prompt: {:?})",
                 job.id,
@@ -205,6 +206,23 @@ pub fn start_worker_loop(
             };
 
             if let Some(r) = res {
+                match &r {
+                    Ok(t) => {
+                        tracing::info!(
+                            "Job id: {} completed in {:.2?} ({} LRC lines)",
+                            job.id,
+                            job_start.elapsed(),
+                            t.segments.len()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Job id: {} failed after {:.2?}: {e}",
+                            job.id,
+                            job_start.elapsed()
+                        );
+                    }
+                }
                 let _ = job.response_tx.send(r.map_err(|e| e.to_string()));
             } else {
                 tracing::info!("Job id: {} was preempted. Re-queuing to heap.", job.id);
