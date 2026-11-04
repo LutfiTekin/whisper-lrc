@@ -55,7 +55,7 @@ Accepts an uploaded audio file, server-local file path, or **hotlink audio strea
 * `artist`: Optional artist name (auto-extracted from ID3/Vorbis tags if omitted)
 * `title`: Optional song title (auto-extracted from ID3/Vorbis tags if omitted)
 * `prompt`: Optional custom context/vocabulary hint appended to `initial_prompt`
-* `isolate`: `true` (default) or `false` (skips vocal isolation for podcasts or speech)
+* `isolate`: `false` (default, fastest) or `true` (enables Demucs vocal isolation before transcription)
 * `format`: `lrc` (default, returns `text/plain`) or `json`
 * `refresh`: `false` (default) or `true` (forces fresh inference, bypassing cache)
 

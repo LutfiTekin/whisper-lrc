@@ -316,7 +316,7 @@ async fn handle_lyrics_multipart(
     let mut prompt = query.prompt;
     let mut output_format = query.format.unwrap_or_else(|| "lrc".to_string());
     let mut refresh = query.refresh.unwrap_or(false);
-    let mut isolate = query.isolate.unwrap_or(true);
+    let mut isolate = query.isolate.unwrap_or(false);
 
     while let Some(field) = multipart
         .next_field()
@@ -439,7 +439,7 @@ async fn handle_lyrics_query(
     let lang = query.lang.unwrap_or_else(|| "ja".to_string());
     let output_format = query.format.unwrap_or_else(|| "lrc".to_string()).to_lowercase();
     let refresh = query.refresh.unwrap_or(false);
-    let isolate = query.isolate.unwrap_or(true);
+    let isolate = query.isolate.unwrap_or(false);
 
     let raw_bytes = if let Some(url) = query.url.or(query.hotlink) {
         fetch_hotlink_audio(&url).await?
@@ -478,7 +478,7 @@ async fn handle_lyrics_json(
     let lang = payload.lang.unwrap_or_else(|| "ja".to_string());
     let output_format = payload.format.unwrap_or_else(|| "lrc".to_string()).to_lowercase();
     let refresh = payload.refresh.unwrap_or(false);
-    let isolate = payload.isolate.unwrap_or(true);
+    let isolate = payload.isolate.unwrap_or(false);
 
     let raw_bytes = if let Some(url) = payload.url.or(payload.hotlink) {
         fetch_hotlink_audio(&url).await?

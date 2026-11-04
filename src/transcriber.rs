@@ -88,6 +88,12 @@ pub fn is_hallucination(text: &str) -> bool {
         "字幕",
         "翻訳",
         "おやすみなさい",
+        "altyazı",
+        "altyazi",
+        "seslibetimleme",
+        "seslendiren",
+        "metinyazarı",
+        "metinyazari",
     ];
 
     if EXACT_DENYLIST.contains(&lower.as_str()) {
@@ -103,6 +109,20 @@ pub fn is_hallucination(text: &str) -> bool {
         "amara.org",
         "thankyouforwatching",
         "thanksforwatching",
+        "seslibetimleme",
+        "seslendiren",
+        "altyazı",
+        "altyazi",
+        "metinyazarı",
+        "metinyazari",
+        "derneğineyaptırılmıştır",
+        "dernegineyaptirilmistir",
+        "seslibetimlemedernegi",
+        "seslibetimlemederneğine",
+        "seslibetimlemedernegine",
+        "aboneol",
+        "beğenmeyiunutmayın",
+        "begenmeyiunutmayin",
     ];
 
     if SUBSTRING_DENYLIST.iter().any(|pat| lower.contains(pat)) {
@@ -254,10 +274,7 @@ impl TranscriberService {
             .create_state()
             .map_err(|e| anyhow::anyhow!("Failed to create Whisper state: {e:?}"))?;
 
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: 5,
-            patience: -1.0,
-        });
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(self.cpu_threads);
         params.set_translate(false);
         params.set_no_context(true);
@@ -299,7 +316,7 @@ impl TranscriberService {
 
         let mut segments = Vec::new();
         let mut lrc_lines = Vec::new();
-        let mut last_text = String::new();
+        let mut recent_window = std::collections::VecDeque::with_capacity(8);
 
         for i in 0..num_segments {
             let start_sec = (state.full_get_segment_t0(i).unwrap_or(0) as f64) / 100.0;
@@ -310,7 +327,13 @@ impl TranscriberService {
                 .trim()
                 .to_string();
 
-            if text.is_empty() || text == last_text || is_hallucination(&text) {
+            if text.is_empty() || is_hallucination(&text) {
+                continue;
+            }
+
+            // Suppress repetitive loops and alternating degenerate sequences (e.g. A -> B -> A -> B)
+            if recent_window.contains(&text) {
+                tracing::debug!("Dropping repeating segment from recent window: {}", text);
                 continue;
             }
 
@@ -339,7 +362,10 @@ impl TranscriberService {
                 }
             }
 
-            last_text = text.clone();
+            if recent_window.len() >= 6 {
+                recent_window.pop_front();
+            }
+            recent_window.push_back(text.clone());
 
             let ts = format_lrc_timestamp(start_sec);
             lrc_lines.push(format!("{ts}{text}"));
