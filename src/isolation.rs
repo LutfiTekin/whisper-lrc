@@ -7,10 +7,7 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::audio::{decode_audio_to_stereo, stereo_to_16k_mono, DecodedAudio};
 
-#[cfg(feature = "cuda")]
-type DemucsBackend = burn::backend::Cuda<f32, i32>;
-
-#[cfg(not(feature = "cuda"))]
+// Native Rust HTDemucs v4 vocal isolation (Burn NdArray SIMD + multi-threaded CPU)
 type DemucsBackend = burn::backend::NdArray<f32>;
 
 static ISOLATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -55,12 +52,12 @@ async fn ensure_demucs_weights(model_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Isolates vocals from mixed audio bytes in-memory using pure-Rust `demucs-rs` (`demucs-core` HTDemucs v4)
-/// on CUDA GPU (or CPU fallback) and returns 16 kHz mono PCM `DecodedAudio`.
+/// on CPU (Burn NdArray multi-threaded SIMD) and returns 16 kHz mono PCM `DecodedAudio`.
 pub async fn isolate_vocals_to_16k_mono(
     audio_bytes: &[u8],
     model_dir: &Path,
 ) -> Result<DecodedAudio> {
-    // Ensure single-flight vocal isolation on GPU
+    // Ensure single-flight vocal isolation to manage CPU load
     let _guard = isolation_mutex().lock().await;
 
     let weights_path = ensure_demucs_weights(model_dir).await?;
@@ -71,10 +68,7 @@ pub async fn isolate_vocals_to_16k_mono(
     let raw_owned = audio_bytes.to_vec();
     let (tx, rx) = oneshot::channel();
 
-    #[cfg(feature = "cuda")]
-    tracing::info!("demucs-rs: isolating vocal stem on CUDA GPU (HTDemucs v4)...");
-    #[cfg(not(feature = "cuda"))]
-    tracing::info!("demucs-rs: isolating vocal stem on CPU (HTDemucs v4)...");
+    tracing::info!("demucs-rs: isolating vocal stem on CPU (HTDemucs v4, NdArray SIMD)...");
 
     std::thread::Builder::new()
         .name("demucs-rs-worker".into())
@@ -112,9 +106,13 @@ pub async fn isolate_vocals_to_16k_mono(
         })
         .context("Failed spawning demucs-rs worker thread")?;
 
-    let decoded = rx
-        .await
-        .context("demucs-rs worker thread panicked or dropped channel")??;
+    let rx_res = match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+        Ok(r) => r.context("demucs-rs worker thread panicked or dropped channel")?,
+        Err(_) => {
+            anyhow::bail!("demucs-rs vocal isolation timed out after 120s");
+        }
+    };
+    let decoded = rx_res?;
 
     tracing::info!(
         "demucs-rs: vocal isolation complete ({:.1}s, {} samples at 16kHz).",
