@@ -148,7 +148,66 @@ pub fn is_hallucination(text: &str) -> bool {
         }
     }
 
+    // Detect word and n-gram repetition loops inside a segment (e.g. "Alou Alou..." or "of the city of the city...")
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() >= 6 {
+        let mut repeat_count = 1;
+        for i in 1..words.len() {
+            if words[i].eq_ignore_ascii_case(words[i - 1]) {
+                repeat_count += 1;
+                if repeat_count >= 5 {
+                    return true;
+                }
+            } else {
+                repeat_count = 1;
+            }
+        }
+
+        for window_size in 2..=4 {
+            if words.len() >= window_size * 4 {
+                let mut loop_count = 1;
+                for i in (window_size..=words.len() - window_size).step_by(window_size) {
+                    let prev = &words[i - window_size..i];
+                    let curr = &words[i..i + window_size];
+                    if prev == curr {
+                        loop_count += 1;
+                        if loop_count >= 4 {
+                            return true;
+                        }
+                    } else {
+                        loop_count = 1;
+                    }
+                }
+            }
+        }
+    }
+
     false
+}
+
+/// Checks whether an `initial_prompt` contains characters compatible with a non-Latin target language.
+/// Prevents Latin English metadata from forcing non-Latin Whisper decoders (Arabic, Japanese, Cyrillic, etc.)
+/// into broken transliteration or English repetition loops.
+pub fn is_prompt_compatible_with_lang(prompt: &str, lang: &str) -> bool {
+    let lang = lang.trim().to_lowercase();
+    match lang.as_str() {
+        "ar" | "fa" | "ur" => prompt.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),
+        "ja" => prompt.chars().any(|c| {
+            ('\u{3040}'..='\u{309F}').contains(&c)
+                || ('\u{30A0}'..='\u{30FF}').contains(&c)
+                || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        }),
+        "zh" | "yue" => prompt.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+        "ko" => prompt.chars().any(|c| ('\u{AC00}'..='\u{D7AF}').contains(&c)),
+        "ru" | "uk" | "be" | "bg" | "mk" | "sr" => {
+            prompt.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+        }
+        "el" => prompt.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c)),
+        "he" | "yi" => prompt.chars().any(|c| ('\u{0590}'..='\u{05FF}').contains(&c)),
+        "th" => prompt.chars().any(|c| ('\u{0E00}'..='\u{0E7F}').contains(&c)),
+        "hi" | "mr" | "ne" => prompt.chars().any(|c| ('\u{0900}'..='\u{097F}').contains(&c)),
+        _ => true,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,20 +355,26 @@ impl TranscriberService {
         params.set_temperature(0.0);
         params.set_temperature_inc(0.0);
 
-        let clean_prompt = prompt
-            .map(|p| p.replace('\0', "").trim().to_string())
-            .filter(|p| !p.is_empty());
-
-        if let Some(ref p) = clean_prompt {
-            tracing::info!("Conditioning Whisper decoder with initial_prompt: \"{p}\"");
-            params.set_initial_prompt(p);
-        }
-
         let lang_clean = lang.trim().to_lowercase();
         if lang_clean != "auto" && !lang_clean.is_empty() {
             params.set_language(Some(&lang_clean));
         } else {
             params.set_language(None);
+        }
+
+        let clean_prompt = prompt
+            .map(|p| p.replace('\0', "").trim().to_string())
+            .filter(|p| !p.is_empty());
+
+        if let Some(ref p) = clean_prompt {
+            if is_prompt_compatible_with_lang(p, &lang_clean) {
+                tracing::info!("Conditioning Whisper decoder with initial_prompt: \"{p}\"");
+                params.set_initial_prompt(p);
+            } else {
+                tracing::info!(
+                    "Skipping initial_prompt \"{p}\" due to script mismatch with target language '{lang_clean}'"
+                );
+            }
         }
 
         let t0 = Instant::now();
