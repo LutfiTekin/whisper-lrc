@@ -127,7 +127,7 @@ async fn handle_health() -> impl IntoResponse {
     Json(json!({
         "status": "healthy",
         "service": "whisper-lrc",
-        "model": "ggml-large-v3-q5_0",
+        "model": whisper_lrc::get_model_filename(),
         "vocal_isolation": "demucs-rs-htdemucs",
         "hotlink_supported": true,
         "runtime": "rust-axum"

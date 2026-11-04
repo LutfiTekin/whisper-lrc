@@ -12,8 +12,8 @@ pub use cache::{CacheKey, LrcCache};
 pub use isolation::{isolate_vocals, isolate_vocals_to_16k_mono};
 pub use queue::PreemptiveQueue;
 pub use transcriber::{
-    build_initial_prompt, format_lrc_timestamp, is_hallucination, LrcSegment, TranscriberService,
-    TranscriptionResult,
+    build_initial_prompt, format_lrc_timestamp, get_model_filename, is_hallucination, LrcSegment,
+    TranscriberService, TranscriptionResult,
 };
 
 /// High-level library helper to transcribe audio bytes directly to LRC text.

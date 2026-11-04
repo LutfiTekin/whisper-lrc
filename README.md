@@ -23,11 +23,12 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
 * **Multi-Layer Anti-Hallucination & Metadata Conditioning**:
   * **Auto-Prompting via Metadata (`artist`, `title`, `prompt`)**: Automatically extracts embedded ID3/Vorbis `Artist` and `TrackTitle` tags via `symphonia` (or uses request parameters) to seed Whisper's `initial_prompt`, preventing phonetic katakana fallback on archaic/stylized lyrics.
   * **RMS Vocal Silence Gate**: Mutes sustained non-vocal passages ($\ge 1.0\text{s}$ below $-42\text{ dBFS}$) to pure digital zero so instrumental percussion/bell outros never trigger phantom speech.
-  * **Beam Search Decoding (`beam_size = 5`)**: Explores 5 simultaneous candidate paths instead of greedy single-token argmax, improving recognition of sustained vowels and choral singing.
-  * **Confidence & Hallucination Filtering**: Enforces `logprob_thold = -1.0`, `entropy_thold = 2.4`, per-segment token probability pruning (`avg_prob >= 0.20`), and a post-processing denylist for common training artifacts (`"アーメン"`, `"ご視聴ありがとうございました"`, repetition loops).
-* **State-of-the-Art Whisper Model**:
-  * Powered by full 32-layer **`large-v3-q5_0`** (5-bit quantization, $\sim$1.08 GB).
-  * Runs 100% on GPU (CUDA) using only $\sim$1.4 GB VRAM for maximum accuracy and fast inference.
+  * **Greedy Decoding with Temperature Fallback**: Uses greedy single-token argmax with dynamic temperature fallback (`temperature_inc = 0.2`) to break out of repetition traps during silence or heavy instrumentals.
+  * **Confidence & Hallucination Filtering**: Enforces `logprob_thold = -1.0`, `entropy_thold = 2.4`, per-segment token probability pruning (`avg_prob >= 0.20`), and a post-processing denylist for common training artifacts (`"アーメン"`, `"ご視聴ありがとうございました"`, Turkish subtitle watermarks, repetition loops).
+* **State-of-the-Art Whisper Model (`large-v3-turbo`)**:
+  * Powered by **`large-v3-turbo`** (4-layer pruned decoder, $\sim$1.6 GB fp16), offering 4x faster inference with significantly reduced hallucination risk on music.
+  * Configurable via `WHISPER_MODEL` environment variable (e.g. `ggml-large-v3-turbo.bin`, `ggml-large-v2.bin`, `ggml-large-v3-q5_0.bin`).
+  * Runs 100% on GPU (CUDA) using only $\sim$1.6–2.1 GB VRAM.
 
 ---
 
@@ -177,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
 | `PORT` | `9500` | Port for the HTTP server |
 | `HOST` | `0.0.0.0` | Bind address |
 | `MODEL_DIR` | `/models` | Directory where Whisper GGML and Demucs `.safetensors` models are cached |
+| `WHISPER_MODEL` | `ggml-large-v3-turbo.bin` | GGML Whisper model filename (e.g. `ggml-large-v3-turbo.bin`, `ggml-large-v2.bin`) |
 | `CPU_THREADS` | `8` | Worker threads allocated for Demucs & CPU inference |
 | `IDLE_VRAM_TTL_SECS` | `600` | Inactivity seconds before dropping VRAM context (0 = keep forever) |
 | `MAX_QUEUE_CAPACITY` | `32` | Maximum queued jobs before returning HTTP 429 |

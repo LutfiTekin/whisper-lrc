@@ -10,6 +10,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - MODEL_DIR=/models
+      - WHISPER_MODEL=${WHISPER_MODEL:-ggml-large-v3-turbo.bin}
       - CPU_THREADS=${CPU_THREADS:-8}
     deploy:
       resources:

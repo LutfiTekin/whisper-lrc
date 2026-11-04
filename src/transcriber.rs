@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-pub const DEFAULT_MODEL_FILENAME: &str = "ggml-large-v3-q5_0.bin";
+pub const DEFAULT_MODEL_FILENAME: &str = "ggml-large-v3-turbo.bin";
+
+pub fn get_model_filename() -> String {
+    std::env::var("WHISPER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL_FILENAME.to_string())
+}
 
 pub fn format_lrc_timestamp(seconds: f64) -> String {
     let s = if seconds < 0.0 { 0.0 } else { seconds };
@@ -182,7 +186,8 @@ impl TranscriberService {
     }
 
     async fn ensure_model(&self) -> Result<PathBuf> {
-        let path = self.model_dir.join(DEFAULT_MODEL_FILENAME);
+        let model_filename = get_model_filename();
+        let path = self.model_dir.join(&model_filename);
 
         if path.exists() {
             return Ok(path);
@@ -192,12 +197,12 @@ impl TranscriberService {
 
         tracing::info!(
             "Model {} not found. Downloading to {:?}...",
-            DEFAULT_MODEL_FILENAME,
+            model_filename,
             path
         );
         let url = format!(
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
-            DEFAULT_MODEL_FILENAME
+            model_filename
         );
 
         let resp = reqwest::get(&url)
@@ -206,14 +211,14 @@ impl TranscriberService {
 
         if !resp.status().is_success() {
             anyhow::bail!(
-                "Failed downloading model {DEFAULT_MODEL_FILENAME}: HTTP {}",
+                "Failed downloading model {model_filename}: HTTP {}",
                 resp.status()
             );
         }
 
         let bytes = resp.bytes().await?;
         tokio::fs::write(&path, &bytes).await?;
-        tracing::info!("Model {} downloaded successfully.", DEFAULT_MODEL_FILENAME);
+        tracing::info!("Model {} downloaded successfully.", model_filename);
 
         Ok(path)
     }
@@ -229,8 +234,9 @@ impl TranscriberService {
 
         let model_path = self.ensure_model().await?;
         let path_str = model_path.to_str().context("Invalid UTF-8 in path")?;
+        let model_filename = get_model_filename();
 
-        tracing::info!("Loading large-v3-q5_0 into GPU VRAM (CUDA)...");
+        tracing::info!("Loading Whisper model '{model_filename}' into GPU VRAM (CUDA)...");
         let mut ctx_params = WhisperContextParameters::default();
         ctx_params.use_gpu(true);
         let ctx = WhisperContext::new_with_params(path_str, ctx_params)
