@@ -223,11 +223,20 @@ impl VocalEnergyProfile {
         }
         let thresh = (peak - 18.0).max(-42.0);
         let (f_start, f_end) = self.frame_range(s, e);
-        self.frame_db[f_start..=f_end]
+        let mut scan_start = f_start;
+        if f_start > 0 && self.frame_db[f_start - 1] >= thresh {
+            while scan_start <= f_end && self.frame_db[scan_start] >= thresh {
+                scan_start += 1;
+            }
+            if scan_start > f_end {
+                return None;
+            }
+        }
+        self.frame_db[scan_start..=f_end]
             .iter()
             .position(|&db| db >= thresh)
             .map(|rel| {
-                let frame = (f_start + rel).saturating_sub(1).max(f_start);
+                let frame = (scan_start + rel).saturating_sub(1).max(f_start);
                 ((frame as f64) * self.frame_sec).clamp(s, e)
             })
     }
