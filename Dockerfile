@@ -34,7 +34,8 @@ RUN mkdir -p src && \
 # Copy actual source and compile application crate
 COPY src ./src
 RUN touch src/lib.rs src/main.rs && \
-    cargo build --release --features cuda
+    cargo build --release --features cuda && \
+    cargo test --release --lib --features cuda
 
 # ==============================================================================
 # Runtime Stage
