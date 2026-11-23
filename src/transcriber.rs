@@ -4,7 +4,15 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
+    WhisperContextParameters,
+};
+
+use crate::alignment::{
+    align_lyrics_to_words, extract_lyrics_prompt_hint, format_lrc_with_breaks, BreakConfig,
+    TimedWord, VocalEnergyProfile,
+};
 
 pub const DEFAULT_MODEL_FILENAME: &str = "ggml-large-v3-turbo.bin";
 
@@ -12,11 +20,77 @@ pub fn get_model_filename() -> String {
     std::env::var("WHISPER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL_FILENAME.to_string())
 }
 
+pub fn is_dtw_enabled() -> bool {
+    std::env::var("WHISPER_DTW")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+pub fn infer_dtw_mode(model_filename: &str) -> DtwMode<'static> {
+    let lower = model_filename.trim().to_ascii_lowercase();
+    if lower.contains("large-v3-turbo") || lower.contains("turbo") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::LargeV3Turbo,
+        }
+    } else if lower.contains("large-v3") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::LargeV3,
+        }
+    } else if lower.contains("large-v2") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::LargeV2,
+        }
+    } else if lower.contains("large-v1") || lower.contains("large") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::LargeV1,
+        }
+    } else if lower.contains("medium.en") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::MediumEn,
+        }
+    } else if lower.contains("medium") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::Medium,
+        }
+    } else if lower.contains("small.en") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::SmallEn,
+        }
+    } else if lower.contains("small") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::Small,
+        }
+    } else if lower.contains("base.en") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::BaseEn,
+        }
+    } else if lower.contains("base") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::Base,
+        }
+    } else if lower.contains("tiny.en") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::TinyEn,
+        }
+    } else if lower.contains("tiny") {
+        DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::Tiny,
+        }
+    } else {
+        DtwMode::TopMost { n_top: 4 }
+    }
+}
+
 pub fn format_lrc_timestamp(seconds: f64) -> String {
-    let s = if seconds < 0.0 { 0.0 } else { seconds };
-    let mins = (s / 60.0) as u32;
-    let remaining_secs = s % 60.0;
-    format!("[{:02}:{:05.2}]", mins, remaining_secs)
+    let s = if seconds.is_finite() && seconds > 0.0 {
+        seconds
+    } else {
+        0.0
+    };
+    let total_centis = (s * 100.0).round() as u64;
+    let mins = total_centis / 6000;
+    let secs_centis = total_centis % 6000;
+    format!("[{:02}:{:02}.{:02}]", mins, secs_centis / 100, secs_centis % 100)
 }
 
 /// Builds a Whisper `initial_prompt` from optional `artist`, `title`, and custom `prompt` fields.
@@ -210,12 +284,35 @@ pub fn is_prompt_compatible_with_lang(prompt: &str, lang: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TranscribeOptions {
+    pub lang: String,
+    pub prompt: Option<String>,
+    pub reference_lyrics: Option<String>,
+    pub isolated: bool,
+    pub breaks: BreakConfig,
+}
+
+impl Default for TranscribeOptions {
+    fn default() -> Self {
+        Self {
+            lang: "ja".to_string(),
+            prompt: None,
+            reference_lyrics: None,
+            isolated: false,
+            breaks: BreakConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LrcSegment {
     pub start: f64,
     pub end: f64,
     pub timestamp: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub words: Vec<TimedWord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +322,77 @@ pub struct TranscriptionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     pub segments: Vec<LrcSegment>,
+    #[serde(default)]
+    pub aligned: bool,
+    #[serde(default)]
+    pub breaks_inserted: usize,
+}
+
+#[derive(Debug, Clone)]
+struct KeptSegmentMeta {
+    norm_text: String,
+    start_sec: f64,
+}
+
+fn round_centis(val: f64) -> f64 {
+    (val * 100.0).round() / 100.0
+}
+
+fn is_unspaced_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x309F
+            | 0x30A0..=0x30FF
+            | 0x4E00..=0x9FFF
+            | 0x3400..=0x4DBF
+            | 0xAC00..=0xD7AF
+            | 0x0E00..=0x0E7F
+    )
+}
+
+fn is_hallucination_loop(
+    history: &[KeptSegmentMeta],
+    text: &str,
+    start_sec: f64,
+    end_sec: f64,
+    avg_prob: f32,
+) -> bool {
+    let norm = text.trim().to_lowercase();
+    if norm.is_empty() {
+        return true;
+    }
+
+    if let Some(prev) = history.last() {
+        if prev.norm_text == norm {
+            if (start_sec - prev.start_sec) < 0.40 || (end_sec - start_sec) < 0.20 {
+                return true;
+            }
+            let consecutive_same = history
+                .iter()
+                .rev()
+                .take_while(|h| h.norm_text == norm)
+                .count();
+            if consecutive_same >= 3 && avg_prob < 0.50 {
+                return true;
+            }
+        }
+    }
+
+    if history.len() >= 5 && avg_prob < 0.50 {
+        let tail = &history[history.len() - 5..];
+        let a = &tail[0].norm_text;
+        let b = &tail[1].norm_text;
+        if a != b
+            && tail[2].norm_text == *a
+            && tail[3].norm_text == *b
+            && tail[4].norm_text == *a
+            && norm == *b
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub struct TranscriberService {
@@ -298,6 +466,17 @@ impl TranscriberService {
         tracing::info!("Loading Whisper model '{model_filename}' into GPU VRAM (CUDA)...");
         let mut ctx_params = WhisperContextParameters::default();
         ctx_params.use_gpu(true);
+        ctx_params.flash_attn(false);
+
+        if is_dtw_enabled() {
+            let dtw_mode = infer_dtw_mode(&model_filename);
+            tracing::info!("Enabling Whisper DTW token timestamps: {:?}", dtw_mode);
+            ctx_params.dtw_parameters(DtwParameters {
+                mode: dtw_mode,
+                dtw_mem_size: 1024 * 1024 * 128,
+            });
+        }
+
         let ctx = WhisperContext::new_with_params(path_str, ctx_params)
             .map_err(|e| anyhow::anyhow!("Failed initializing Whisper context: {e:?}"))?;
 
@@ -334,7 +513,24 @@ impl TranscriberService {
         lang: &str,
         prompt: Option<&str>,
     ) -> Result<TranscriptionResult> {
+        let options = TranscribeOptions {
+            lang: lang.to_string(),
+            prompt: prompt.map(str::to_string),
+            ..TranscribeOptions::default()
+        };
+        let duration_secs = (pcm_16k_mono.len() as f64) / 16000.0;
+        self.transcribe_with_options(pcm_16k_mono, duration_secs, &options)
+            .await
+    }
+
+    pub async fn transcribe_with_options(
+        &self,
+        pcm_16k_mono: &[f32],
+        duration_secs: f64,
+        options: &TranscribeOptions,
+    ) -> Result<TranscriptionResult> {
         let ctx = self.get_or_load_context().await?;
+        let eot_id = ctx.token_eot();
         let mut state = ctx
             .create_state()
             .map_err(|e| anyhow::anyhow!("Failed to create Whisper state: {e:?}"))?;
@@ -349,22 +545,32 @@ impl TranscriberService {
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
         params.set_suppress_nst(true);
+        params.set_token_timestamps(true);
+        params.set_split_on_word(true);
         params.set_no_speech_thold(0.6);
         params.set_logprob_thold(-1.0);
         params.set_entropy_thold(2.4);
         params.set_temperature(0.0);
         params.set_temperature_inc(0.0);
 
-        let lang_clean = lang.trim().to_lowercase();
+        let lang_clean = options.lang.trim().to_lowercase();
         if lang_clean != "auto" && !lang_clean.is_empty() {
             params.set_language(Some(&lang_clean));
         } else {
             params.set_language(None);
         }
 
-        let clean_prompt = prompt
+        let clean_prompt = options
+            .prompt
+            .as_deref()
             .map(|p| p.replace('\0', "").trim().to_string())
-            .filter(|p| !p.is_empty());
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                options
+                    .reference_lyrics
+                    .as_deref()
+                    .and_then(|lyr| extract_lyrics_prompt_hint(lyr, 180))
+            });
 
         if let Some(ref p) = clean_prompt {
             if is_prompt_compatible_with_lang(p, &lang_clean) {
@@ -393,13 +599,21 @@ impl TranscriberService {
             num_segments
         );
 
+        let effective_duration = if duration_secs > 0.0 {
+            duration_secs
+        } else {
+            (pcm_16k_mono.len() as f64) / 16000.0
+        };
+        let energy = VocalEnergyProfile::from_pcm(pcm_16k_mono, 16000);
+
         let mut segments = Vec::new();
-        let mut lrc_lines = Vec::new();
-        let mut recent_window = std::collections::VecDeque::with_capacity(8);
+        let mut all_words = Vec::new();
+        let mut history: Vec<KeptSegmentMeta> = Vec::new();
 
         for i in 0..num_segments {
-            let start_sec = (state.full_get_segment_t0(i).unwrap_or(0) as f64) / 100.0;
-            let end_sec = (state.full_get_segment_t1(i).unwrap_or(0) as f64) / 100.0;
+            let seg_start = (state.full_get_segment_t0(i).unwrap_or(0) as f64) / 100.0;
+            let seg_end = ((state.full_get_segment_t1(i).unwrap_or(0) as f64) / 100.0)
+                .max(seg_start);
             let text = state
                 .full_get_segment_text_lossy(i)
                 .unwrap_or_default()
@@ -410,58 +624,163 @@ impl TranscriberService {
                 continue;
             }
 
-            // Suppress repetitive loops and alternating degenerate sequences (e.g. A -> B -> A -> B)
-            if recent_window.contains(&text) {
-                tracing::debug!("Dropping repeating segment from recent window: {}", text);
-                continue;
-            }
+            let mut seg_words: Vec<TimedWord> = Vec::new();
+            let mut prob_sum = 0.0_f32;
+            let mut prob_count = 0usize;
 
-            // Filter out low-confidence noise segments by checking average token probability
             if let Ok(n_tokens) = state.full_n_tokens(i) {
-                if n_tokens > 0 {
-                    let mut prob_sum = 0.0_f32;
-                    let mut prob_count = 0usize;
-                    for t in 0..n_tokens {
-                        if let Ok(p) = state.full_get_token_prob(i, t) {
-                            prob_sum += p;
-                            prob_count += 1;
+                for t in 0..n_tokens {
+                    let Ok(data) = state.full_get_token_data(i, t) else {
+                        continue;
+                    };
+                    if data.id >= eot_id {
+                        continue;
+                    }
+                    let raw_tok = state.full_get_token_text_lossy(i, t).unwrap_or_default();
+                    let tok_trimmed = raw_tok.trim();
+                    if tok_trimmed.is_empty()
+                        || tok_trimmed.starts_with("[_")
+                        || tok_trimmed.starts_with("<|")
+                    {
+                        continue;
+                    }
+
+                    prob_sum += data.p;
+                    prob_count += 1;
+
+                    let mut tok_start = (data.t0 as f64 / 100.0).max(seg_start);
+                    let mut tok_end = (data.t1 as f64 / 100.0).min(seg_end).max(tok_start);
+
+                    if data.t_dtw >= 0 {
+                        let dtw_sec = (data.t_dtw as f64) / 100.0;
+                        if dtw_sec >= seg_start - 0.25 && dtw_sec <= seg_end + 0.25 {
+                            if dtw_sec - tok_start > 0.60 {
+                                tok_start = (dtw_sec - 0.15).max(tok_start);
+                            }
+                            if tok_end - dtw_sec > 0.80 {
+                                tok_end = (dtw_sec + 0.35).min(tok_end);
+                            }
+                            if tok_end <= tok_start {
+                                tok_end = (dtw_sec + 0.15).min(seg_end).max(tok_start + 0.05);
+                            }
                         }
                     }
-                    if prob_count > 0 {
-                        let avg_prob = prob_sum / (prob_count as f32);
-                        if avg_prob < 0.20 {
-                            tracing::debug!(
-                                "Dropping low-confidence segment (avg_prob={:.2}): {}",
-                                avg_prob,
-                                text
-                            );
-                            continue;
-                        }
+
+                    let starts_new_word = seg_words.is_empty()
+                        || raw_tok.starts_with(|c: char| c.is_whitespace())
+                        || tok_trimmed.chars().next().is_some_and(is_unspaced_char)
+                        || seg_words
+                            .last()
+                            .and_then(|w| w.text.chars().last())
+                            .is_some_and(is_unspaced_char);
+
+                    if starts_new_word {
+                        seg_words.push(TimedWord {
+                            start: tok_start,
+                            end: tok_end,
+                            text: tok_trimmed.to_string(),
+                            prob: data.p,
+                        });
+                    } else if let Some(prev_word) = seg_words.last_mut() {
+                        prev_word.text.push_str(tok_trimmed);
+                        prev_word.end = prev_word.end.max(tok_end);
+                        prev_word.prob = (prev_word.prob + data.p) * 0.5;
                     }
                 }
             }
 
-            if recent_window.len() >= 6 {
-                recent_window.pop_front();
-            }
-            recent_window.push_back(text.clone());
+            let avg_prob = if prob_count > 0 {
+                prob_sum / (prob_count as f32)
+            } else {
+                1.0
+            };
 
-            let ts = format_lrc_timestamp(start_sec);
-            lrc_lines.push(format!("{ts}{text}"));
+            if prob_count > 0 && avg_prob < 0.20 {
+                tracing::debug!(
+                    "Dropping low-confidence segment (avg_prob={:.2}): {}",
+                    avg_prob,
+                    text
+                );
+                continue;
+            }
+
+            let raw_start = seg_words.first().map(|w| w.start).unwrap_or(seg_start);
+            let raw_end = seg_words
+                .last()
+                .map(|w| w.end)
+                .unwrap_or(seg_end)
+                .max(raw_start);
+
+            let (refined_start, refined_end) =
+                energy.refine_bounds(raw_start, raw_end, options.isolated);
+
+            if energy.peak_db_in_range(refined_start, refined_end) < -52.0 {
+                tracing::debug!(
+                    "Dropping silent/non-vocal phantom segment at {:.2}s: {}",
+                    refined_start,
+                    text
+                );
+                continue;
+            }
+
+            if is_hallucination_loop(&history, &text, refined_start, refined_end, avg_prob) {
+                tracing::debug!(
+                    "Dropping hallucination loop segment (avg_prob={:.2}): {}",
+                    avg_prob,
+                    text
+                );
+                continue;
+            }
+
+            history.push(KeptSegmentMeta {
+                norm_text: text.trim().to_lowercase(),
+                start_sec: refined_start,
+            });
+            if history.len() > 8 {
+                history.remove(0);
+            }
+
+            for w in &mut seg_words {
+                let ws = w.start.max(refined_start).min(refined_end);
+                let we = w.end.min(refined_end).max(ws);
+                w.start = round_centis(ws);
+                w.end = round_centis(we);
+            }
+            all_words.extend(seg_words.iter().cloned());
+
+            let start = round_centis(refined_start);
+            let end = round_centis(refined_end).max(start);
+            let ts = format_lrc_timestamp(start);
 
             segments.push(LrcSegment {
-                start: (start_sec * 100.0).round() / 100.0,
-                end: (end_sec * 100.0).round() / 100.0,
+                start,
+                end,
                 timestamp: ts,
                 text,
+                words: seg_words,
             });
         }
 
-        let lrc_output = if lrc_lines.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", lrc_lines.join("\n"))
-        };
+        let mut aligned = false;
+        let mut final_segments = segments;
+        if let Some(ref raw_lyrics) = options.reference_lyrics {
+            if !raw_lyrics.trim().is_empty() {
+                let aligned_segments = align_lyrics_to_words(
+                    raw_lyrics,
+                    &all_words,
+                    &energy,
+                    effective_duration,
+                    options.isolated,
+                );
+                if !aligned_segments.is_empty() {
+                    final_segments = aligned_segments;
+                    aligned = true;
+                }
+            }
+        }
+
+        let (lrc_output, breaks_inserted) =
+            format_lrc_with_breaks(&final_segments, effective_duration, &options.breaks);
 
         *self.last_used.lock().await = Instant::now();
 
@@ -469,7 +788,98 @@ impl TranscriberService {
             lrc: lrc_output,
             lang: lang_clean,
             prompt: clean_prompt,
-            segments,
+            segments: final_segments,
+            aligned,
+            breaks_inserted,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_lrc_timestamp_no_60s_overflow() {
+        assert_eq!(format_lrc_timestamp(59.996), "[01:00.00]");
+        assert_eq!(format_lrc_timestamp(0.0), "[00:00.00]");
+        assert_eq!(format_lrc_timestamp(151.35), "[02:31.35]");
+    }
+
+    #[test]
+    fn test_infer_dtw_mode_presets() {
+        assert!(matches!(
+            infer_dtw_mode("ggml-large-v3-turbo.bin"),
+            DtwMode::ModelPreset {
+                model_preset: DtwModelPreset::LargeV3Turbo
+            }
+        ));
+        assert!(matches!(
+            infer_dtw_mode("ggml-large-v3.bin"),
+            DtwMode::ModelPreset {
+                model_preset: DtwModelPreset::LargeV3
+            }
+        ));
+        assert!(matches!(
+            infer_dtw_mode("ggml-medium.en.bin"),
+            DtwMode::ModelPreset {
+                model_preset: DtwModelPreset::MediumEn
+            }
+        ));
+        assert!(matches!(
+            infer_dtw_mode("custom-finetune.bin"),
+            DtwMode::TopMost { n_top: 4 }
+        ));
+    }
+
+    #[test]
+    fn test_music_safe_repetition_keeps_chorus_drops_hallucination_loop() {
+        let mut history = Vec::new();
+        for (idx, t) in [10.0, 13.0, 16.0, 19.0].iter().enumerate() {
+            let line = if idx % 2 == 0 {
+                "The boys wanna be her"
+            } else {
+                "The girls wanna be her"
+            };
+            assert!(!is_hallucination_loop(&history, line, *t, t + 1.8, 0.85));
+            history.push(KeptSegmentMeta {
+                norm_text: line.to_lowercase(),
+                start_sec: *t,
+            });
+        }
+
+        // High-confidence hook repeating 4th time is kept
+        assert!(!is_hallucination_loop(
+            &history,
+            "Turn around, bright eyes",
+            22.0,
+            24.0,
+            0.88
+        ));
+
+        // Rapid collapsed duplicate (<0.40s gap) is dropped
+        let collapsed_hist = vec![KeptSegmentMeta {
+            norm_text: "turn around".to_string(),
+            start_sec: 30.0,
+        }];
+        assert!(is_hallucination_loop(
+            &collapsed_hist,
+            "Turn around",
+            30.2,
+            30.8,
+            0.90
+        ));
+
+        // Low-confidence alternating A-B-A-B-A-B loop is dropped
+        let loop_hist = vec![
+            KeptSegmentMeta { norm_text: "you".into(), start_sec: 200.0 },
+            KeptSegmentMeta { norm_text: "me".into(), start_sec: 201.0 },
+            KeptSegmentMeta { norm_text: "you".into(), start_sec: 202.0 },
+            KeptSegmentMeta { norm_text: "me".into(), start_sec: 203.0 },
+            KeptSegmentMeta { norm_text: "you".into(), start_sec: 204.0 },
+        ];
+        assert!(is_hallucination_loop(&loop_hist, "Me", 205.0, 206.0, 0.30));
+        // Same alternating pattern with high singing confidence is preserved
+        assert!(!is_hallucination_loop(&loop_hist, "Me", 205.0, 206.0, 0.85));
     }
 }

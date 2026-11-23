@@ -7,6 +7,10 @@ pub struct CacheKey {
     pub lang: String,
     pub isolate: bool,
     pub prompt: Option<String>,
+    pub lyrics_hash: Option<String>,
+    pub insert_breaks: bool,
+    pub break_offset_ms: u64,
+    pub min_break_gap_ms: u64,
 }
 
 #[derive(Clone)]

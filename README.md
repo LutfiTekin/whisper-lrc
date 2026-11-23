@@ -7,7 +7,9 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
 ## Key Features
 
 * **Pure Native Audio Pipeline**: Decodes MP3, WAV, FLAC, and AAC directly to 16 kHz mono PCM in pure Rust using `symphonia` (no external `ffmpeg` binary required).
-* **Synchronized LRC Output**: Generates standard `[mm:ss.xx]Lyrics` timestamps for music players.
+* **Synchronized LRC Output + Instrumental Break Markers**: Generates `[mm:ss.xx] Lyrics` timestamps and automatically inserts blank `[mm:ss.xx]` break markers `1500 ms` after the last sung word before instrumental breaks and song outros (`breaks`, `break_offset_ms`, `min_break_gap_ms`).
+* **DTW Word-Level Timestamps & Vocal-Band RMS Refinement**: Enables Whisper.cpp Dynamic Time Warping (`WHISPER_DTW=true`) for token/word-level timings (`words` in JSON output) and tightens segment boundaries onto `300 Hz–3400 Hz` vocal-band RMS energy onsets and offsets.
+* **Optional Known-Lyrics Alignment**: Accepts plain or rough LRC `lyrics` (`lyrics` / `reference_lyrics`) and monotonically aligns them to Whisper's word timings via Needleman–Wunsch DP, preserving exact wording while inheriting word-accurate timestamps and instrumental break markers.
 * **In-Memory LRU Cache**: Instant $\sim$0.1 ms responses for identical audio hashes (`X-Cache: HIT`).
 * **Preemptive Priority Queue (Concurrency = 1)**:
   * Guarantees single-flight inference to prevent GPU VRAM out-of-memory crashes.
@@ -24,7 +26,7 @@ A high-performance, stateless audio-to-LRC synchronized lyrics microservice and 
   * **Auto-Prompting via Metadata (`artist`, `title`, `prompt`)**: Automatically extracts embedded ID3/Vorbis `Artist` and `TrackTitle` tags via `symphonia` (or uses request parameters) to seed Whisper's `initial_prompt`, preventing phonetic katakana fallback on archaic/stylized lyrics.
   * **RMS Vocal Silence Gate**: Mutes sustained non-vocal passages ($\ge 1.0\text{s}$ below $-42\text{ dBFS}$) to pure digital zero so instrumental percussion/bell outros never trigger phantom speech.
   * **Greedy Decoding with Temperature Fallback**: Uses greedy single-token argmax with dynamic temperature fallback (`temperature_inc = 0.2`) to break out of repetition traps during silence or heavy instrumentals.
-  * **Confidence & Hallucination Filtering**: Enforces `logprob_thold = -1.0`, `entropy_thold = 2.4`, per-segment token probability pruning (`avg_prob >= 0.20`), and a post-processing denylist for common training artifacts (`"アーメン"`, `"ご視聴ありがとうございました"`, Turkish subtitle watermarks, repetition loops).
+  * **Confidence & Hallucination Filtering**: Enforces `logprob_thold = -1.0`, `entropy_thold = 2.4`, per-segment spoken-token probability pruning (`avg_prob >= 0.20`), vocal-band peak silence rejection (`< -52 dBFS`), music-safe repetition detection (preserving repeating choruses/hooks while dropping collapsed/low-confidence loops), and a post-processing denylist for common training artifacts (`"アーメン"`, `"ご視聴ありがとうございました"`, Turkish subtitle watermarks).
 * **State-of-the-Art Whisper Model (`large-v3-turbo`)**:
   * Powered by **`large-v3-turbo`** (4-layer pruned decoder, $\sim$1.6 GB fp16), offering 4x faster inference with significantly reduced hallucination risk on music.
   * Configurable via `WHISPER_MODEL` environment variable (e.g. `ggml-large-v3-turbo.bin`, `ggml-large-v2.bin`, `ggml-large-v3-q5_0.bin`).
@@ -56,7 +58,11 @@ Accepts an uploaded audio file, server-local file path, or **hotlink audio strea
 * `artist`: Optional artist name (auto-extracted from ID3/Vorbis tags if omitted)
 * `title`: Optional song title (auto-extracted from ID3/Vorbis tags if omitted)
 * `prompt`: Optional custom context/vocabulary hint appended to `initial_prompt`
-* `isolate`: `false` (default, fastest) or `true` (enables Demucs vocal isolation before transcription)
+* `lyrics`: Optional known plain or rough LRC lyrics to monotonically align against the audio (`lyrics` or `reference_lyrics`)
+* `isolate`: `false` (default, or `DEFAULT_ISOLATE`) or `true` (enables Demucs vocal isolation before transcription)
+* `breaks`: `true` (default, or `INSERT_INSTRUMENTAL_BREAKS`) or `false` (inserts blank `[mm:ss.xx]` lines during instrumental gaps & outros)
+* `break_offset_ms`: Milliseconds after the preceding line's last word end to place the blank line (default `1500`)
+* `min_break_gap_ms`: Minimum silence/instrumental gap in milliseconds required to emit a blank line (default `4000`)
 * `format`: `lrc` (default, returns `text/plain`) or `json`
 * `refresh`: `false` (default) or `true` (forces fresh inference, bypassing cache)
 
@@ -184,3 +190,8 @@ async fn main() -> anyhow::Result<()> {
 | `MAX_QUEUE_CAPACITY` | `32` | Maximum queued jobs before returning HTTP 429 |
 | `CACHE_SIZE` | `500` | Max entries in the in-memory LRU cache |
 | `CACHE_TTL_SECS` | `86400` | Expiration time for cached lyrics (24 hours) |
+| `DEFAULT_ISOLATE` | `false` | Default `isolate` behavior when omitted in requests |
+| `WHISPER_DTW` | `true` | Enable Whisper.cpp DTW word/token-level timestamps |
+| `INSERT_INSTRUMENTAL_BREAKS` | `true` | Emit blank `[mm:ss.xx]` lines during instrumental breaks and outros |
+| `INSTRUMENTAL_BREAK_OFFSET_MS` | `1500` | Blank-line offset after the previous line's final word end (ms) |
+| `INSTRUMENTAL_BREAK_MIN_GAP_MS` | `4000` | Minimum gap between lines (or after final line) to emit a blank line (ms) |

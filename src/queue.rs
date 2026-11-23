@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::transcriber::{TranscriberService, TranscriptionResult};
+use crate::transcriber::{TranscribeOptions, TranscriberService, TranscriptionResult};
 
 pub const DEFAULT_LONG_AUDIO_THRESHOLD: f64 = 600.0; // 10 minutes
 
@@ -14,8 +14,7 @@ pub struct Job {
     pub id: u64,
     pub pcm: Vec<f32>,
     pub duration_secs: f64,
-    pub lang: String,
-    pub prompt: Option<String>,
+    pub options: TranscribeOptions,
     pub response_tx: oneshot::Sender<Result<TranscriptionResult, String>>,
     pub cancel_token: CancellationToken,
 }
@@ -60,8 +59,7 @@ struct RunningJobInfo {
     id: u64,
     duration_secs: f64,
     pcm: Vec<f32>,
-    lang: String,
-    prompt: Option<String>,
+    options: TranscribeOptions,
     cancel_token: CancellationToken,
 }
 
@@ -88,8 +86,7 @@ impl PreemptiveQueue {
         &self,
         pcm: Vec<f32>,
         duration_secs: f64,
-        lang: String,
-        prompt: Option<String>,
+        options: TranscribeOptions,
     ) -> Result<oneshot::Receiver<Result<TranscriptionResult, String>>, String> {
         let mut heap = self.heap.lock().await;
 
@@ -105,8 +102,7 @@ impl PreemptiveQueue {
             id,
             pcm,
             duration_secs,
-            lang,
-            prompt,
+            options,
             response_tx: tx,
             cancel_token,
         };
@@ -184,24 +180,25 @@ pub fn start_worker_loop(
                     id: job.id,
                     duration_secs: job.duration_secs,
                     pcm: job.pcm.clone(),
-                    lang: job.lang.clone(),
-                    prompt: job.prompt.clone(),
+                    options: job.options.clone(),
                     cancel_token: job.cancel_token.clone(),
                 });
             }
 
             let job_start = Instant::now();
             tracing::info!(
-                "Processing job id: {} ({:.1}s, lang: {}, prompt: {:?})",
+                "Processing job id: {} ({:.1}s, lang: {}, isolated: {}, align_lyrics: {}, prompt: {:?})",
                 job.id,
                 job.duration_secs,
-                job.lang,
-                job.prompt
+                job.options.lang,
+                job.options.isolated,
+                job.options.reference_lyrics.is_some(),
+                job.options.prompt
             );
 
             let cancel_token = job.cancel_token.clone();
             let res = tokio::select! {
-                r = transcriber.transcribe(&job.pcm, &job.lang, job.prompt.as_deref()) => Some(r),
+                r = transcriber.transcribe_with_options(&job.pcm, job.duration_secs, &job.options) => Some(r),
                 _ = cancel_token.cancelled() => None,
             };
 
@@ -209,10 +206,11 @@ pub fn start_worker_loop(
                 match &r {
                     Ok(t) => {
                         tracing::info!(
-                            "Job id: {} completed in {:.2?} ({} LRC lines)",
+                            "Job id: {} completed in {:.2?} ({} LRC lines, {} breaks)",
                             job.id,
                             job_start.elapsed(),
-                            t.segments.len()
+                            t.segments.len(),
+                            t.breaks_inserted
                         );
                     }
                     Err(e) => {
@@ -230,8 +228,7 @@ pub fn start_worker_loop(
                     id: job.id,
                     pcm: job.pcm,
                     duration_secs: job.duration_secs,
-                    lang: job.lang,
-                    prompt: job.prompt,
+                    options: job.options,
                     response_tx: job.response_tx,
                     cancel_token: CancellationToken::new(),
                 };
