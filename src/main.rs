@@ -14,14 +14,12 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use whisper_lrc::alignment::{extract_lyrics_prompt_hint, BreakConfig};
-use whisper_lrc::audio::{
-    apply_rms_silence_gate, decode_audio_to_16k_mono, extract_audio_metadata,
-};
+use whisper_lrc::alignment::BreakConfig;
+use whisper_lrc::audio::{apply_rms_silence_gate, decode_audio_to_16k_mono};
 use whisper_lrc::cache::{CacheKey, LrcCache};
 use whisper_lrc::isolation::isolate_vocals_to_16k_mono;
 use whisper_lrc::queue::{start_worker_loop, PreemptiveQueue};
-use whisper_lrc::transcriber::{build_initial_prompt, TranscribeOptions, TranscriberService};
+use whisper_lrc::transcriber::{TranscribeOptions, TranscriberService};
 
 #[derive(Clone)]
 struct AppState {
@@ -121,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     let default_breaks = BreakConfig {
         insert_breaks: env_bool("INSERT_INSTRUMENTAL_BREAKS", true),
         break_offset_ms: env_u64("INSTRUMENTAL_BREAK_OFFSET_MS", 1500),
-        min_break_gap_ms: env_u64("INSTRUMENTAL_BREAK_MIN_GAP_MS", 4000),
+        min_break_gap_ms: env_u64("INSTRUMENTAL_BREAK_MIN_GAP_MS", 5000),
     };
 
     tracing::info!("Initializing Whisper Transcriber Service...");
@@ -237,8 +235,8 @@ async fn process_audio_pipeline(
     state: &AppState,
     raw_bytes: Vec<u8>,
     lang: String,
-    artist: Option<String>,
-    title: Option<String>,
+    _artist: Option<String>,
+    _title: Option<String>,
     prompt: Option<String>,
     reference_lyrics: Option<String>,
     isolate: bool,
@@ -248,14 +246,6 @@ async fn process_audio_pipeline(
     output_format: String,
     refresh: bool,
 ) -> Result<Response, (StatusCode, String)> {
-    // Auto-extract embedded ID3/Vorbis artist & title tags if not supplied in request
-    let (effective_artist, effective_title) = if artist.is_none() || title.is_none() {
-        let embedded = extract_audio_metadata(&raw_bytes);
-        (artist.or(embedded.artist), title.or(embedded.title))
-    } else {
-        (artist, title)
-    };
-
     let break_cfg = BreakConfig {
         insert_breaks: breaks.unwrap_or(state.default_breaks.insert_breaks),
         break_offset_ms: break_offset_ms.unwrap_or(state.default_breaks.break_offset_ms),
@@ -272,22 +262,13 @@ async fn process_audio_pipeline(
         hex::encode(h.finalize())
     });
 
-    let prompt_hint = prompt
+    // Only seed Whisper when caller passes an explicit prompt; auto-generated metadata or
+    // lyric prompts degrade chunk recall and cause hallucinations during instrumental solos.
+    let initial_prompt = prompt
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            clean_lyrics
-                .as_deref()
-                .and_then(|lyr| extract_lyrics_prompt_hint(lyr, 180))
-        });
-
-    let initial_prompt = build_initial_prompt(
-        effective_artist.as_deref(),
-        effective_title.as_deref(),
-        prompt_hint.as_deref(),
-    );
+        .map(|s| s.replace('\0', ""));
 
     // Calculate SHA-256 hash for in-memory LRU cache
     let mut hasher = Sha256::new();
@@ -338,22 +319,24 @@ async fn process_audio_pipeline(
     }
 
     // 2. Vocal Isolation (pure-Rust demucs-rs) & Decode to 16kHz mono PCM
-    let mut decoded = if isolate {
+    let (mut decoded, actually_isolated) = if isolate {
         match isolate_vocals_to_16k_mono(&raw_bytes, &state.model_dir).await {
-            Ok(d) => d,
+            Ok(d) => (d, true),
             Err(e) => {
                 tracing::warn!("demucs-rs vocal isolation failed, falling back to mixed audio: {e}");
-                tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&raw_bytes))
+                let d = tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&raw_bytes))
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?;
+                (d, false)
             }
         }
     } else {
-        tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&raw_bytes))
+        let d = tokio::task::spawn_blocking(move || decode_audio_to_16k_mono(&raw_bytes))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Thread error: {e}")))?
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Audio decoding error: {e}")))?;
+        (d, false)
     };
 
     // 3. Apply RMS silence gate to mute sustained instrumental/drum tails
@@ -364,7 +347,7 @@ async fn process_audio_pipeline(
         lang: lang.clone(),
         prompt: initial_prompt.clone(),
         reference_lyrics: clean_lyrics,
-        isolated: isolate,
+        isolated: actually_isolated,
         breaks: break_cfg,
     };
 

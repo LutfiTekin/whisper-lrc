@@ -51,6 +51,13 @@ async fn ensure_demucs_weights(model_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn isolation_timeout_secs() -> u64 {
+    std::env::var("ISOLATION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(240)
+}
+
 /// Isolates vocals from mixed audio bytes in-memory using pure-Rust `demucs-rs` (`demucs-core` HTDemucs v4)
 /// on CPU (Burn NdArray multi-threaded SIMD) and returns 16 kHz mono PCM `DecodedAudio`.
 pub async fn isolate_vocals_to_16k_mono(
@@ -106,10 +113,16 @@ pub async fn isolate_vocals_to_16k_mono(
         })
         .context("Failed spawning demucs-rs worker thread")?;
 
-    let rx_res = match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
-        Ok(r) => r.context("demucs-rs worker thread panicked or dropped channel")?,
-        Err(_) => {
-            anyhow::bail!("demucs-rs vocal isolation timed out after 120s");
+    let timeout_secs = isolation_timeout_secs();
+    let rx_res = if timeout_secs == 0 {
+        rx.await
+            .context("demucs-rs worker thread panicked or dropped channel")?
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+            Ok(r) => r.context("demucs-rs worker thread panicked or dropped channel")?,
+            Err(_) => {
+                anyhow::bail!("demucs-rs vocal isolation timed out after {timeout_secs}s");
+            }
         }
     };
     let decoded = rx_res?;

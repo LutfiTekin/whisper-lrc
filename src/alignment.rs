@@ -25,7 +25,7 @@ impl Default for BreakConfig {
         Self {
             insert_breaks: true,
             break_offset_ms: 1500,
-            min_break_gap_ms: 4000,
+            min_break_gap_ms: 5000,
         }
     }
 }
@@ -148,6 +148,149 @@ impl VocalEnergyProfile {
             .fold(-100.0_f32, f32::max)
     }
 
+    pub fn mean_db_in_range(&self, start_sec: f64, end_sec: f64) -> f32 {
+        if self.frame_db.is_empty() || end_sec <= start_sec {
+            return -100.0;
+        }
+        let (f0, f1) = self.frame_range(start_sec, end_sec);
+        if f0 > f1 || f0 >= self.frame_db.len() {
+            return -100.0;
+        }
+        let slice = &self.frame_db[f0..=f1];
+        let sum: f32 = slice.iter().copied().sum();
+        sum / (slice.len() as f32)
+    }
+
+    /// Splits audio into vocal-active chunks bounded by `max_chunk_secs`, cutting at the
+    /// quietest 0.40s energy dip inside `[min_chunk_secs, max_chunk_secs]` and skipping pure silence.
+    pub fn plan_audio_chunks(&self, min_chunk_secs: f64, max_chunk_secs: f64) -> Vec<(f64, f64)> {
+        if self.frame_db.is_empty() || self.total_duration_secs <= 0.0 {
+            return Vec::new();
+        }
+
+        let min_c = min_chunk_secs.max(5.0);
+        let max_c = max_chunk_secs.max(min_c + 2.0);
+        const WINDOW_FRAMES: usize = 20; // 400 ms at 20 ms/frame
+        const SILENCE_PEAK_DB: f32 = -50.0;
+
+        let mut chunks = Vec::new();
+        let mut cursor = 0.0_f64;
+
+        // Skip quiet leading instrumental intros (leaving 1.5s pre-roll) so Whisper's first
+        // decoder attention doesn't lock onto pure accompaniment before vocals begin.
+        let track_peak = self.peak_db_in_range(0.0, self.total_duration_secs);
+        if track_peak >= -30.0 && self.total_duration_secs > 15.0 {
+            let intro_thresh = (track_peak - 22.0).clamp(-38.0, -31.5);
+            const INTRO_WIN_FRAMES: usize = 50; // 1.0 s at 20 ms/frame
+            if self.frame_db.len() >= INTRO_WIN_FRAMES {
+                for f in 0..=(self.frame_db.len() - INTRO_WIN_FRAMES) {
+                    let mean: f32 = self.frame_db[f..f + INTRO_WIN_FRAMES]
+                        .iter()
+                        .copied()
+                        .sum::<f32>()
+                        / (INTRO_WIN_FRAMES as f32);
+                    if mean >= intro_thresh {
+                        let first_active_sec = (f as f64) * self.frame_sec;
+                        let candidate = (first_active_sec - 1.5).max(0.0);
+                        let intro_peak_cap = (track_peak - 14.0).max(-24.0);
+                        if candidate >= 3.0
+                            && self.peak_db_in_range(0.0, candidate) < intro_peak_cap
+                        {
+                            cursor = candidate;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        while cursor < self.total_duration_secs - 0.10 {
+            if self.total_duration_secs - cursor <= max_c {
+                if self.peak_db_in_range(cursor, self.total_duration_secs) >= SILENCE_PEAK_DB {
+                    chunks.push((cursor, self.total_duration_secs));
+                }
+                break;
+            }
+
+            let search_start = (cursor + min_c).min(self.total_duration_secs);
+            let search_end = (cursor + max_c).min(self.total_duration_secs);
+            let (s_f, e_f) = self.frame_range(search_start, search_end);
+            let span = e_f.saturating_sub(s_f) + 1;
+            let w = WINDOW_FRAMES.min(span).max(1);
+
+            let mut best_start = s_f;
+            let mut best_mean = f32::INFINITY;
+            for idx in s_f..=(e_f + 1 - w) {
+                let mean: f32 =
+                    self.frame_db[idx..idx + w].iter().copied().sum::<f32>() / (w as f32);
+                if mean < best_mean {
+                    best_mean = mean;
+                    best_start = idx;
+                }
+            }
+
+            let mut cut = ((best_start as f64 + (w as f64) * 0.5) * self.frame_sec)
+                .clamp(cursor + min_c * 0.5, self.total_duration_secs);
+            if cut <= cursor + 0.50 {
+                cut = (cursor + max_c).min(self.total_duration_secs);
+            }
+
+            if self.peak_db_in_range(cursor, cut) >= SILENCE_PEAK_DB {
+                chunks.push((cursor, cut));
+            }
+            cursor = cut;
+        }
+
+        chunks
+    }
+
+    /// Trims a stretched Whisper tail once 0.40s rolling vocal-band energy drops well below the
+    /// word's active peak (`anchor_end_sec` bounds the end of the known active portion).
+    pub fn trim_trailing_tail(
+        &self,
+        start_sec: f64,
+        end_sec: f64,
+        anchor_end_sec: f64,
+        is_isolated: bool,
+    ) -> f64 {
+        let s = start_sec.clamp(0.0, self.total_duration_secs);
+        let e = end_sec.clamp(s, self.total_duration_secs);
+        let a = anchor_end_sec.clamp((s + 0.20).min(e), e);
+        if self.frame_db.is_empty() || e - a <= 0.35 {
+            return e;
+        }
+
+        let vocal_peak = self.peak_db_in_range(s, a);
+        if vocal_peak < -50.0 {
+            return e;
+        }
+
+        let drop_thresh = if is_isolated {
+            (vocal_peak - 20.0).max(-46.0)
+        } else {
+            (vocal_peak - 8.5).max(-36.0)
+        };
+
+        const WINDOW_FRAMES: usize = 20; // 400 ms at 20 ms/frame
+        let (f_anchor, f_end) = self.frame_range(a, e);
+        if f_end + 1 < f_anchor + WINDOW_FRAMES {
+            return e;
+        }
+
+        for f in f_anchor..=(f_end + 1 - WINDOW_FRAMES) {
+            let mean: f32 = self.frame_db[f..f + WINDOW_FRAMES]
+                .iter()
+                .copied()
+                .sum::<f32>()
+                / (WINDOW_FRAMES as f32);
+            if mean < drop_thresh {
+                return (((f + 2) as f64) * self.frame_sec).clamp(a, e);
+            }
+        }
+
+        e
+    }
+
     /// Tightens coarse segment boundaries onto actual vocal-band energy onset and offset.
     pub fn refine_bounds(&self, start_sec: f64, end_sec: f64, is_isolated: bool) -> (f64, f64) {
         let s = start_sec.clamp(0.0, self.total_duration_secs);
@@ -169,7 +312,7 @@ impl VocalEnergyProfile {
         let offset_thresh = if is_isolated {
             (local_peak - 26.0).max(-48.0)
         } else {
-            (local_peak - 24.0).max(-40.0)
+            (local_peak - 14.0).max(-36.0)
         };
 
         let (f_start, f_end) = self.frame_range(s, e);
@@ -200,7 +343,7 @@ impl VocalEnergyProfile {
             let offset_frame = (last_active + 2).min(f_end);
             let mut candidate = (((offset_frame + 1) as f64) * self.frame_sec).min(e);
             if !is_isolated {
-                candidate = candidate.max(e - 1.5);
+                candidate = candidate.max(e - 5.0);
             }
             refined_end = candidate
                 .max((refined_start + 0.20).min(e))
@@ -386,6 +529,86 @@ pub fn extract_lyrics_prompt_hint(raw: &str, max_chars: usize) -> Option<String>
         if next_len <= max_chars {
             hint.push_str(sep);
             hint.push_str(&line);
+        } else if hint.is_empty() {
+            let clipped: String = line.chars().take(max_chars).collect();
+            hint.push_str(clipped.trim_end());
+            break;
+        } else {
+            break;
+        }
+    }
+
+    let trimmed = hint.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Extracts up to `max_chars` of clean reference lyrics centered around `center_frac` (`0.0..=1.0`)
+/// within `+-window_frac`, for seeding chunked Whisper decoding across long songs.
+pub fn extract_lyrics_chunk_hint(
+    raw: &str,
+    center_frac: f64,
+    window_frac: f64,
+    max_chars: usize,
+) -> Option<String> {
+    if max_chars == 0 {
+        return None;
+    }
+    let lines = parse_reference_lyrics(raw);
+    if lines.is_empty() {
+        return None;
+    }
+
+    let n = lines.len();
+    let c = center_frac.clamp(0.0, 1.0);
+    let w = window_frac.clamp(0.05, 1.0);
+
+    if c >= 0.88 {
+        let mut selected_rev = Vec::new();
+        let mut used_chars = 0usize;
+        for line in lines.iter().rev() {
+            let sep_len = if selected_rev.is_empty() { 0 } else { 2 };
+            let line_chars = line.chars().count();
+            if used_chars + sep_len + line_chars <= max_chars {
+                selected_rev.push(line.as_str());
+                used_chars += sep_len + line_chars;
+            } else if selected_rev.is_empty() {
+                let clipped: String = line.chars().take(max_chars).collect();
+                let trimmed = clipped.trim().to_string();
+                return if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+            } else {
+                break;
+            }
+        }
+        selected_rev.reverse();
+        let joined = selected_rev.join(", ");
+        let trimmed = joined.trim().to_string();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+    }
+
+    let center_idx = ((c * (n as f64)).round() as usize).min(n - 1);
+    let lead = (n / 25).clamp(1, 3);
+    let start_idx = center_idx.saturating_sub(lead);
+    let end_idx = (((c + w).min(1.0) * (n as f64)).ceil() as usize).clamp(start_idx + 1, n);
+
+    let mut hint = String::new();
+    for line in &lines[start_idx..end_idx] {
+        let sep = if hint.is_empty() { "" } else { ", " };
+        let next_len = hint.chars().count() + sep.chars().count() + line.chars().count();
+        if next_len <= max_chars {
+            hint.push_str(sep);
+            hint.push_str(line);
         } else if hint.is_empty() {
             let clipped: String = line.chars().take(max_chars).collect();
             hint.push_str(clipped.trim_end());
@@ -741,10 +964,39 @@ pub fn align_lyrics_to_words(
             per_line_matches[line_idx].push((pos_in_line, word_idx));
         }
 
-        for (line_idx, line_matches) in per_line_matches.into_iter().enumerate() {
+        for (line_idx, mut line_matches) in per_line_matches.into_iter().enumerate() {
             if line_matches.is_empty() {
                 continue;
             }
+
+            // Reject outlier single-word matches separated by > 2.2s from the line's main cluster
+            if line_matches.len() >= 2 {
+                let mut clusters: Vec<Vec<(usize, usize)>> = vec![vec![line_matches[0]]];
+                for &pair in &line_matches[1..] {
+                    let prev_w_idx = clusters.last().unwrap().last().unwrap().1;
+                    let gap = words[pair.1].start - words[prev_w_idx].end;
+                    if gap > 2.20 {
+                        clusters.push(vec![pair]);
+                    } else {
+                        clusters.last_mut().unwrap().push(pair);
+                    }
+                }
+                if clusters.len() > 1 {
+                    line_matches = clusters
+                        .into_iter()
+                        .max_by(|a, b| {
+                            let a_prob: f32 = a.iter().map(|&(_, wi)| words[wi].prob).sum();
+                            let b_prob: f32 = b.iter().map(|&(_, wi)| words[wi].prob).sum();
+                            a.len().cmp(&b.len()).then_with(|| {
+                                a_prob
+                                    .partial_cmp(&b_prob)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                        })
+                        .unwrap();
+                }
+            }
+
             let &(first_pos, first_word_idx) = line_matches.first().unwrap();
             let &(last_pos, last_word_idx) = line_matches.last().unwrap();
             let tok_len = anchors[line_idx].token_count.max(1);
@@ -755,7 +1007,18 @@ pub fn align_lyrics_to_words(
             let raw_start = (words[first_word_idx].start - 0.35 * (missed_leading as f64)).max(0.0);
             let raw_end =
                 (words[last_word_idx].end + 0.35 * (missed_trailing as f64)).min(total_dur);
-            let (refined_start, refined_end) = energy.refine_bounds(raw_start, raw_end, is_isolated);
+            let tail_capped_end = if missed_trailing == 0 {
+                energy.trim_trailing_tail(
+                    words[first_word_idx].start,
+                    raw_end,
+                    (words[last_word_idx].start + 0.50).min(raw_end),
+                    is_isolated,
+                )
+            } else {
+                raw_end
+            };
+            let (refined_start, refined_end) =
+                energy.refine_bounds(raw_start, tail_capped_end, is_isolated);
 
             let mut line_words = Vec::with_capacity(line_matches.len());
             let mut last_seen_word = None;
@@ -770,6 +1033,30 @@ pub fn align_lyrics_to_words(
             anchors[line_idx].end = refined_end.max(refined_start + 0.15).min(total_dur);
             anchors[line_idx].anchored = true;
             anchors[line_idx].words = line_words;
+        }
+    }
+
+    // Enforce non-overlapping anchored bounds so stretched tails don't crush unanchored gaps
+    let anchored_indices: Vec<usize> = anchors
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, a)| a.anchored.then_some(idx))
+        .collect();
+    for pair in anchored_indices.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        let b_start = anchors[b].start;
+        if anchors[a].start < b_start {
+            if b == a + 1 {
+                if anchors[a].end > b_start {
+                    anchors[a].end = b_start.max((anchors[a].start + 0.15).min(b_start));
+                }
+            } else if anchors[a].end > b_start - 0.50 {
+                let cap_end = anchors[a].start
+                    + ((anchors[a].token_count.max(1) as f64) * 0.45 + 0.8).clamp(1.2, 4.5);
+                let bound_end = (b_start - 0.25).max(anchors[a].start + 0.15).min(b_start);
+                anchors[a].end = cap_end.min(bound_end).max(anchors[a].start);
+            }
         }
     }
 
@@ -798,15 +1085,70 @@ pub fn align_lyrics_to_words(
         };
 
         let span = (win_end - win_start).max(0.0);
+        let max_plausible: f64 = anchors[run_start..run_end]
+            .iter()
+            .map(|a| ((a.token_count.max(1) as f64) * 0.45 + 1.2).clamp(1.8, 5.5))
+            .sum();
+
+        let (sub_start, sub_end) =
+            if run_start > 0 && run_end < anchors.len() && span > max_plausible + 5.0 {
+                let start_probe_end = (win_start + max_plausible).min(win_end);
+                let end_probe_start = (win_end - max_plausible).max(win_start);
+                let start_db = energy.mean_db_in_range(
+                    (win_start + 0.5).min(start_probe_end),
+                    start_probe_end,
+                );
+                let end_db = energy.mean_db_in_range(end_probe_start, win_end);
+                let pre_end_db = energy.mean_db_in_range(
+                    (win_end - 3.5).max(win_start),
+                    (win_end - 0.5).max(win_start),
+                );
+                if start_db > end_db + 4.0 && pre_end_db < start_db - 4.0 {
+                    (win_start, start_probe_end)
+                } else {
+                    (end_probe_start, win_end)
+                }
+            } else if run_start == 0 && run_end < anchors.len() && span > max_plausible + 5.0 {
+                ((win_end - max_plausible).max(0.0), win_end)
+            } else if run_end == anchors.len() {
+                let track_peak = energy.peak_db_in_range(0.0, total_dur);
+                let active_thresh = (track_peak - 24.0).max(-42.0);
+                let (f0, f1) = energy.frame_range(win_start, total_dur);
+                let active_end = if !energy.frame_db.is_empty() && f0 <= f1 {
+                    energy.frame_db[f0..=f1]
+                        .iter()
+                        .rev()
+                        .position(|&db| db >= active_thresh)
+                        .map(|rev| {
+                            let last_active = f1 - rev;
+                            (((last_active + 2) as f64) * energy.frame_sec)
+                                .clamp(win_start, total_dur)
+                        })
+                        .unwrap_or((win_start + max_plausible).min(total_dur))
+                } else {
+                    (win_start + max_plausible).min(total_dur)
+                };
+                let min_end =
+                    (win_start + 0.25 * ((run_end - run_start) as f64)).min(total_dur);
+                let end_capped = active_end
+                    .min(win_start + max_plausible * 1.6)
+                    .min(total_dur)
+                    .max(min_end);
+                (win_start, end_capped)
+            } else {
+                (win_start, win_end)
+            };
+
+        let sub_span = (sub_end - sub_start).max(0.0);
         let total_weight: usize = anchors[run_start..run_end]
             .iter()
             .map(|a| a.token_count.max(1))
             .sum();
 
-        let mut cursor = win_start;
+        let mut cursor = sub_start;
         for anchor in &mut anchors[run_start..run_end] {
             let weight = anchor.token_count.max(1) as f64;
-            let slot_dur = span * (weight / (total_weight as f64));
+            let slot_dur = sub_span * (weight / (total_weight as f64));
             let slot_start = cursor;
             let slot_end = (cursor + slot_dur).min(total_dur);
             cursor = slot_end;
@@ -1075,5 +1417,149 @@ The boys wanna be her";
         assert_eq!(aligned.len(), 2);
         assert!((aligned[0].start - 14.0).abs() <= 0.15);
         assert!((aligned[1].start - 18.2).abs() <= 0.15);
+    }
+
+    #[test]
+    fn test_plan_audio_chunks_splits_at_quiet_dips_and_skips_silence() {
+        let sr = 16000usize;
+        let total_secs = 85usize;
+        let mut pcm = vec![0.0_f32; sr * total_secs];
+
+        // Vocal activity 0..22s, quiet dip 22..24s, vocal 24..55s, total silence 55..85s
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / sr as f64;
+            if (0.5..22.0).contains(&t) || (24.0..55.0).contains(&t) {
+                *s = (0.20 * (2.0 * PI * 500.0 * t).sin()) as f32;
+            }
+        }
+
+        let energy = VocalEnergyProfile::from_pcm(&pcm, sr);
+        let chunks = energy.plan_audio_chunks(18.0, 28.0);
+
+        assert!(!chunks.is_empty());
+        for &(s, e) in &chunks {
+            assert!(e - s <= 28.05, "chunk {s}..{e} exceeds max_chunk_secs");
+            assert!(s < 55.0, "pure trailing silence chunk should be skipped");
+        }
+        // First split should land inside the 22..24s quiet dip
+        assert!(
+            chunks[0].1 >= 21.8 && chunks[0].1 <= 24.2,
+            "expected first cut in quiet dip [22..24], got {}",
+            chunks[0].1
+        );
+    }
+
+    #[test]
+    fn test_extract_lyrics_chunk_hint_near_end_includes_outro_lines() {
+        let lyrics: Vec<String> = (1..=60).map(|i| format!("Lyric line number {i}")).collect();
+        let raw = lyrics.join("\n");
+        let hint = extract_lyrics_chunk_hint(&raw, 0.96, 0.25, 100).unwrap();
+        assert!(
+            hint.contains("Lyric line number 60"),
+            "expected final line in outro chunk hint, got {hint}"
+        );
+    }
+
+    #[test]
+    fn test_trim_trailing_tail_cuts_instrumental_decay() {
+        let sr = 16000usize;
+        let mut pcm = vec![0.0_f32; sr * 8];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / sr as f64;
+            if (1.0..2.2).contains(&t) {
+                *s = (0.35 * (2.0 * PI * 600.0 * t).sin()) as f32;
+            } else if (2.2..6.5).contains(&t) {
+                // Soft -14 dB relative instrumental bed
+                *s = (0.07 * (2.0 * PI * 600.0 * t).sin()) as f32;
+            }
+        }
+        let energy = VocalEnergyProfile::from_pcm(&pcm, sr);
+        let trimmed = energy.trim_trailing_tail(1.0, 6.5, 2.1, false);
+        assert!(
+            trimmed <= 2.6,
+            "expected stretched tail to trim near 2.2s, got {trimmed}"
+        );
+    }
+
+    #[test]
+    fn test_align_preserves_interior_and_outro_breaks_with_unanchored_lines() {
+        let raw_lyrics = "\
+First chorus starts
+Bridge pickup cue
+Second verse continues
+Outro fade away";
+
+        let word_specs = [
+            (10.0, 10.6, "first"),
+            (10.6, 11.2, "chorus"),
+            (11.2, 12.0, "starts"),
+            // 12..45s instrumental break, "Bridge pickup cue" unanchored before 48s
+            (48.0, 48.6, "second"),
+            (48.6, 49.2, "verse"),
+            (49.2, 50.0, "continues"),
+            // "Outro fade away" unanchored at 50..52s followed by silence until 65s
+        ];
+        let words: Vec<TimedWord> = word_specs
+            .iter()
+            .map(|&(s, e, t)| TimedWord {
+                start: s,
+                end: e,
+                text: t.to_string(),
+                prob: 0.9,
+            })
+            .collect();
+
+        let sr = 16000usize;
+        let total_secs = 65usize;
+        let mut pcm = vec![0.0_f32; sr * total_secs];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / sr as f64;
+            if (10.0..12.0).contains(&t)
+                || (45.2..50.0).contains(&t)
+                || (50.3..52.2).contains(&t)
+            {
+                *s = (0.30 * (2.0 * PI * 500.0 * t).sin()) as f32;
+            }
+        }
+
+        let energy = VocalEnergyProfile::from_pcm(&pcm, sr);
+        let aligned = align_lyrics_to_words(raw_lyrics, &words, &energy, total_secs as f64, false);
+        assert_eq!(aligned.len(), 4);
+        assert!(
+            aligned[1].start >= 44.0,
+            "pickup line should sit near resuming vocals after break, got {}",
+            aligned[1].start
+        );
+        assert!(
+            aligned[3].end <= 55.0,
+            "outro line should not stretch into silent outro, got {}",
+            aligned[3].end
+        );
+
+        let (_lrc, breaks) = format_lrc_with_breaks(&aligned, total_secs as f64, &BreakConfig::default());
+        assert_eq!(breaks, 2, "expected interior + outro breaks");
+    }
+
+    #[test]
+    fn test_plan_audio_chunks_skips_quiet_leading_intro() {
+        let sr = 16000usize;
+        let total_secs = 40usize;
+        let mut pcm = vec![0.0_f32; sr * total_secs];
+
+        // 0..8s quiet -41 dB intro, 8..40s louder -15 dB vocal-band signal
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / sr as f64;
+            let amp = if t < 8.0 { 0.012 } else { 0.25 };
+            *s = (amp * (2.0 * PI * 600.0 * t).sin()) as f32;
+        }
+
+        let energy = VocalEnergyProfile::from_pcm(&pcm, sr);
+        let chunks = energy.plan_audio_chunks(18.0, 28.0);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0].0 >= 5.5 && chunks[0].0 <= 7.0,
+            "expected chunk 0 to start ~1.5s before vocals (5.5..7.0), got {}",
+            chunks[0].0
+        );
     }
 }
