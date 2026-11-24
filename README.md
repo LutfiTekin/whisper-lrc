@@ -62,7 +62,7 @@ Accepts an uploaded audio file, server-local file path, or **hotlink audio strea
 * `isolate`: `false` (default, or `DEFAULT_ISOLATE`) or `true` (enables Demucs vocal isolation before transcription)
 * `breaks`: `true` (default, or `INSERT_INSTRUMENTAL_BREAKS`) or `false` (inserts blank `[mm:ss.xx]` lines during instrumental gaps & outros)
 * `break_offset_ms`: Milliseconds after the preceding line's last word end to place the blank line (default `1500`)
-* `min_break_gap_ms`: Minimum silence/instrumental gap in milliseconds required to emit a blank line (default `4000`)
+* `min_break_gap_ms`: Minimum silence/instrumental gap in milliseconds required to emit a blank line (default `5000`)
 * `format`: `lrc` (default, returns `text/plain`) or `json`
 * `refresh`: `false` (default) or `true` (forces fresh inference, bypassing cache)
 
@@ -191,7 +191,8 @@ async fn main() -> anyhow::Result<()> {
 | `CACHE_SIZE` | `500` | Max entries in the in-memory LRU cache |
 | `CACHE_TTL_SECS` | `86400` | Expiration time for cached lyrics (24 hours) |
 | `DEFAULT_ISOLATE` | `false` | Default `isolate` behavior when omitted in requests |
+| `ISOLATION_TIMEOUT_SECS` | `240` | Timeout in seconds for `demucs-rs` vocal isolation (`0` = unlimited) |
 | `WHISPER_DTW` | `true` | Enable Whisper.cpp DTW word/token-level timestamps |
 | `INSERT_INSTRUMENTAL_BREAKS` | `true` | Emit blank `[mm:ss.xx]` lines during instrumental breaks and outros |
 | `INSTRUMENTAL_BREAK_OFFSET_MS` | `1500` | Blank-line offset after the previous line's final word end (ms) |
-| `INSTRUMENTAL_BREAK_MIN_GAP_MS` | `4000` | Minimum gap between lines (or after final line) to emit a blank line (ms) |
+| `INSTRUMENTAL_BREAK_MIN_GAP_MS` | `5000` | Minimum gap between lines (or after final line) to emit a blank line (ms) |

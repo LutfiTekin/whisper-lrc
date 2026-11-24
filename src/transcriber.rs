@@ -10,8 +10,7 @@ use whisper_rs::{
 };
 
 use crate::alignment::{
-    align_lyrics_to_words, extract_lyrics_prompt_hint, format_lrc_with_breaks, BreakConfig,
-    TimedWord, VocalEnergyProfile,
+    align_lyrics_to_words, format_lrc_with_breaks, BreakConfig, TimedWord, VocalEnergyProfile,
 };
 
 pub const DEFAULT_MODEL_FILENAME: &str = "ggml-large-v3-turbo.bin";
@@ -172,6 +171,11 @@ pub fn is_hallucination(text: &str) -> bool {
         "seslendiren",
         "metinyazarı",
         "metinyazari",
+        "musicplaying",
+        "captioning",
+        "subtitles",
+        "music",
+        "yourewelcome",
     ];
 
     if EXACT_DENYLIST.contains(&lower.as_str()) {
@@ -201,10 +205,50 @@ pub fn is_hallucination(text: &str) -> bool {
         "aboneol",
         "beğenmeyiunutmayın",
         "begenmeyiunutmayin",
+        "wellberightback",
+        "staytuned",
+        "commercialbreak",
+        "guitarsolo",
+        "pianosolo",
+        "drumsolo",
+        "instrumentalbreak",
+        "songlyrics",
     ];
 
     if SUBSTRING_DENYLIST.iter().any(|pat| lower.contains(pat)) {
         return true;
+    }
+
+    // Drop pure non-lexical vocalise loops (e.g. "Ooh, ooh, ooh, ooh") during instrumental fills
+    let ws_words: Vec<&str> = trimmed.split_whitespace().collect();
+    if ws_words.len() >= 3 {
+        let mut first_vocalise: Option<String> = None;
+        let mut all_same_vocalise = true;
+        for w in &ws_words {
+            let clean: String = w
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            if !matches!(
+                clean.as_str(),
+                "ooh" | "oo" | "uh" | "um" | "hm" | "hmm" | "mm" | "mmm" | "ah" | "aah" | "ahh"
+            ) {
+                all_same_vocalise = false;
+                break;
+            }
+            match &first_vocalise {
+                None => first_vocalise = Some(clean),
+                Some(first) if *first != clean => {
+                    all_same_vocalise = false;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if all_same_vocalise {
+            return true;
+        }
     }
 
     // Detect single-character degenerate repetition (e.g. "ああああああああ")
@@ -350,6 +394,138 @@ fn is_unspaced_char(c: char) -> bool {
     )
 }
 
+fn is_pronoun_i(word: &str) -> bool {
+    let trimmed = word.trim_matches(|c: char| !c.is_alphabetic() && c != '\'' && c != '’');
+    trimmed == "I" || trimmed.starts_with("I'") || trimmed.starts_with("I’")
+}
+
+fn is_trailing_connector(word: &str) -> bool {
+    let clean: String = word
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’')
+        .to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "the"
+            | "a"
+            | "an"
+            | "of"
+            | "in"
+            | "to"
+            | "my"
+            | "your"
+            | "our"
+            | "his"
+            | "her"
+            | "and"
+            | "or"
+            | "but"
+            | "i"
+            | "i'm"
+            | "i’m"
+            | "bit"
+            | "gonna"
+            | "can"
+            | "we'll"
+            | "we’ll"
+            | "don't"
+            | "don’t"
+            | "fall"
+    )
+}
+
+fn is_lone_filler_word(text: &str) -> bool {
+    let mut parts = text.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let clean: String = first
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    matches!(
+        clean.as_str(),
+        "the" | "a" | "an" | "and" | "or" | "of" | "to" | "in" | "it" | "is" | "so" | "unknown"
+    )
+}
+
+fn join_words_text(words: &[TimedWord]) -> String {
+    let mut out = String::new();
+    for w in words {
+        let t = w.text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            let prev_unspaced = out.chars().last().is_some_and(is_unspaced_char);
+            let next_unspaced = t.chars().next().is_some_and(is_unspaced_char);
+            if !(prev_unspaced && next_unspaced) {
+                out.push(' ');
+            }
+        }
+        out.push_str(t);
+    }
+    out
+}
+
+/// Splits multi-line Whisper segments into individual lyric lines at word-level pauses
+/// or capitalized phrase starts so choruses and verses don't collapse into 20s blocks.
+fn split_segment_by_word_pauses(words: &[TimedWord]) -> Vec<Vec<TimedWord>> {
+    if words.len() <= 1 {
+        return if words.is_empty() {
+            Vec::new()
+        } else {
+            vec![words.to_vec()]
+        };
+    }
+
+    let mut groups = Vec::new();
+    let mut start_idx = 0usize;
+    let mut cur_chars = words[0].text.chars().count();
+
+    for idx in 1..words.len() {
+        let prev = &words[idx - 1];
+        let next = &words[idx];
+        let word_count = idx - start_idx;
+        let remaining_words = words.len() - idx;
+        let gap = (next.start - prev.end).max(0.0);
+
+        let prev_ends_comma = prev.text.trim_end().ends_with(',');
+        let next_starts_upper = next
+            .text
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_uppercase())
+            && !is_pronoun_i(&next.text);
+
+        let pause_split = (gap >= 1.50)
+            || (gap >= 0.85
+                && word_count >= 2
+                && remaining_words >= 2
+                && !(is_trailing_connector(&prev.text) && !next_starts_upper))
+            || (gap >= 0.55 && word_count >= 2 && remaining_words >= 2 && next_starts_upper);
+        let phrase_split = cur_chars >= 22
+            && word_count >= 3
+            && remaining_words >= 2
+            && !prev_ends_comma
+            && next_starts_upper;
+
+        if pause_split || phrase_split {
+            groups.push(words[start_idx..idx].to_vec());
+            start_idx = idx;
+            cur_chars = next.text.chars().count();
+        } else {
+            cur_chars += 1 + next.text.chars().count();
+        }
+    }
+
+    groups.push(words[start_idx..].to_vec());
+    groups
+}
+
 fn is_hallucination_loop(
     history: &[KeptSegmentMeta],
     text: &str,
@@ -372,7 +548,22 @@ fn is_hallucination_loop(
                 .rev()
                 .take_while(|h| h.norm_text == norm)
                 .count();
-            if consecutive_same >= 3 && avg_prob < 0.50 {
+            if consecutive_same >= 2 && (start_sec - prev.start_sec) <= 1.60 {
+                return true;
+            }
+            if consecutive_same >= 2
+                && norm.split_whitespace().count() <= 2
+                && (start_sec - prev.start_sec) <= 4.50
+            {
+                return true;
+            }
+            if consecutive_same >= 4
+                && (start_sec - prev.start_sec) <= 4.50
+                && avg_prob < 0.85
+            {
+                return true;
+            }
+            if consecutive_same >= 3 && (avg_prob < 0.50 || (start_sec - prev.start_sec) <= 2.50) {
                 return true;
             }
         }
@@ -535,70 +726,7 @@ impl TranscriberService {
             .create_state()
             .map_err(|e| anyhow::anyhow!("Failed to create Whisper state: {e:?}"))?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_n_threads(self.cpu_threads);
-        params.set_translate(false);
-        params.set_no_context(true);
-        params.set_print_special(false);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_suppress_blank(true);
-        params.set_suppress_nst(true);
-        params.set_token_timestamps(true);
-        params.set_split_on_word(true);
-        params.set_no_speech_thold(0.6);
-        params.set_logprob_thold(-1.0);
-        params.set_entropy_thold(2.4);
-        params.set_temperature(0.0);
-        params.set_temperature_inc(0.0);
-
         let lang_clean = options.lang.trim().to_lowercase();
-        if lang_clean != "auto" && !lang_clean.is_empty() {
-            params.set_language(Some(&lang_clean));
-        } else {
-            params.set_language(None);
-        }
-
-        let clean_prompt = options
-            .prompt
-            .as_deref()
-            .map(|p| p.replace('\0', "").trim().to_string())
-            .filter(|p| !p.is_empty())
-            .or_else(|| {
-                options
-                    .reference_lyrics
-                    .as_deref()
-                    .and_then(|lyr| extract_lyrics_prompt_hint(lyr, 180))
-            });
-
-        if let Some(ref p) = clean_prompt {
-            if is_prompt_compatible_with_lang(p, &lang_clean) {
-                tracing::info!("Conditioning Whisper decoder with initial_prompt: \"{p}\"");
-                params.set_initial_prompt(p);
-            } else {
-                tracing::info!(
-                    "Skipping initial_prompt \"{p}\" due to script mismatch with target language '{lang_clean}'"
-                );
-            }
-        }
-
-        let t0 = Instant::now();
-        state
-            .full(params, pcm_16k_mono)
-            .map_err(|e| anyhow::anyhow!("Whisper inference error: {e:?}"))?;
-        let inference_dur = t0.elapsed();
-
-        let num_segments = state
-            .full_n_segments()
-            .map_err(|e| anyhow::anyhow!("Failed reading segment count: {e:?}"))?;
-
-        tracing::info!(
-            "Whisper inference finished in {:.2?} (raw segments: {})",
-            inference_dur,
-            num_segments
-        );
-
         let effective_duration = if duration_secs > 0.0 {
             duration_secs
         } else {
@@ -606,160 +734,361 @@ impl TranscriberService {
         };
         let energy = VocalEnergyProfile::from_pcm(pcm_16k_mono, 16000);
 
+        let mut chunks = energy.plan_audio_chunks(22.0, 29.0);
+        if chunks.is_empty() && effective_duration > 0.05 {
+            chunks.push((0.0, effective_duration));
+        }
+
+        let explicit_prompt = options
+            .prompt
+            .as_deref()
+            .map(|p| p.replace('\0', "").trim().to_string())
+            .filter(|p| !p.is_empty());
+
+        let clean_prompt = explicit_prompt.clone();
+
+        tracing::info!(
+            "Whisper inference across {} energy-guided chunk(s) (total {:.1}s)...",
+            chunks.len(),
+            effective_duration
+        );
+
+        let t0 = Instant::now();
+        let mut total_raw_segments: i32 = 0;
         let mut segments = Vec::new();
         let mut all_words = Vec::new();
         let mut history: Vec<KeptSegmentMeta> = Vec::new();
 
-        for i in 0..num_segments {
-            let seg_start = (state.full_get_segment_t0(i).unwrap_or(0) as f64) / 100.0;
-            let seg_end = ((state.full_get_segment_t1(i).unwrap_or(0) as f64) / 100.0)
-                .max(seg_start);
-            let text = state
-                .full_get_segment_text_lossy(i)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            if text.is_empty() || is_hallucination(&text) {
+        for (chunk_idx, &(chunk_start, chunk_end)) in chunks.iter().enumerate() {
+            let s_idx = ((chunk_start * 16000.0).round() as usize).min(pcm_16k_mono.len());
+            let e_idx = ((chunk_end * 16000.0).round() as usize).clamp(s_idx, pcm_16k_mono.len());
+            let raw_chunk_pcm = &pcm_16k_mono[s_idx..e_idx];
+            if raw_chunk_pcm.len() < 1600 {
                 continue;
             }
 
-            let mut seg_words: Vec<TimedWord> = Vec::new();
-            let mut prob_sum = 0.0_f32;
-            let mut prob_count = 0usize;
+            let chunk_vocal_peak_db = energy.peak_db_in_range(chunk_start, chunk_end);
+            let raw_peak = raw_chunk_pcm
+                .iter()
+                .fold(0.0_f32, |m, &x| m.max(x.abs()));
+            let boosted_pcm: Option<Vec<f32>> =
+                if chunk_vocal_peak_db >= -38.0 && raw_peak > 1e-4 && raw_peak < 0.35 {
+                    let gain = (0.70 / raw_peak).min(5.6);
+                    Some(
+                        raw_chunk_pcm
+                            .iter()
+                            .map(|&x| (x * gain).clamp(-1.0, 1.0))
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+            let decode_pcm: &[f32] = boosted_pcm.as_deref().unwrap_or(raw_chunk_pcm);
 
-            if let Ok(n_tokens) = state.full_n_tokens(i) {
-                for t in 0..n_tokens {
-                    let Ok(data) = state.full_get_token_data(i, t) else {
-                        continue;
-                    };
-                    if data.id >= eot_id {
+            let chunk_prompt = explicit_prompt.as_deref();
+
+            let allow_retry = chunk_end - chunk_start >= 8.0 && chunk_vocal_peak_db >= -32.0;
+            let attempts: &[(f32, f32)] = if allow_retry {
+                &[(0.0, 0.82), (0.2, 0.90)]
+            } else {
+                &[(0.0, 0.82)]
+            };
+
+            for &(temp, no_speech_thold) in attempts {
+                let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+                params.set_n_threads(self.cpu_threads);
+                params.set_translate(false);
+                params.set_no_context(true);
+                params.set_print_special(false);
+                params.set_print_progress(false);
+                params.set_print_realtime(false);
+                params.set_print_timestamps(false);
+                params.set_suppress_blank(true);
+                params.set_suppress_nst(true);
+                params.set_token_timestamps(true);
+                params.set_split_on_word(true);
+                params.set_max_tokens(180);
+                params.set_no_speech_thold(no_speech_thold);
+                params.set_logprob_thold(-1.3);
+                params.set_entropy_thold(2.6);
+                params.set_temperature(temp);
+                params.set_temperature_inc(0.0);
+
+                if lang_clean != "auto" && !lang_clean.is_empty() {
+                    params.set_language(Some(&lang_clean));
+                } else {
+                    params.set_language(None);
+                }
+
+                if let Some(p) = chunk_prompt {
+                    if is_prompt_compatible_with_lang(p, &lang_clean) {
+                        if chunk_idx == 0 && temp == 0.0 {
+                            tracing::info!("Conditioning Whisper decoder with initial_prompt: \"{p}\"");
+                        }
+                        params.set_initial_prompt(p);
+                    } else if chunk_idx == 0 && temp == 0.0 {
+                        tracing::info!(
+                            "Skipping initial_prompt \"{p}\" due to script mismatch with target language '{lang_clean}'"
+                        );
+                    }
+                }
+
+                state
+                    .full(params, decode_pcm)
+                    .map_err(|e| anyhow::anyhow!("Whisper inference error: {e:?}"))?;
+
+                let num_segments = state
+                    .full_n_segments()
+                    .map_err(|e| anyhow::anyhow!("Failed reading segment count: {e:?}"))?;
+                total_raw_segments += num_segments;
+
+                let mut attempt_history = history.clone();
+                let mut chunk_segments = Vec::new();
+                let mut chunk_words = Vec::new();
+
+                for i in 0..num_segments {
+                    let seg_start = (chunk_start
+                        + (state.full_get_segment_t0(i).unwrap_or(0) as f64) / 100.0)
+                        .clamp(chunk_start, chunk_end);
+                    let seg_end = (chunk_start
+                        + (state.full_get_segment_t1(i).unwrap_or(0) as f64) / 100.0)
+                        .clamp(seg_start, chunk_end);
+                    let raw_text = state
+                        .full_get_segment_text_lossy(i)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+
+                    if raw_text.is_empty() || is_hallucination(&raw_text) {
                         continue;
                     }
-                    let raw_tok = state.full_get_token_text_lossy(i, t).unwrap_or_default();
-                    let tok_trimmed = raw_tok.trim();
-                    if tok_trimmed.is_empty()
-                        || tok_trimmed.starts_with("[_")
-                        || tok_trimmed.starts_with("<|")
-                    {
-                        continue;
-                    }
 
-                    prob_sum += data.p;
-                    prob_count += 1;
+                    let mut seg_words: Vec<TimedWord> = Vec::new();
+                    let mut prob_sum = 0.0_f32;
+                    let mut prob_count = 0usize;
 
-                    let mut tok_start = (data.t0 as f64 / 100.0).max(seg_start);
-                    let mut tok_end = (data.t1 as f64 / 100.0).min(seg_end).max(tok_start);
-
-                    if data.t_dtw >= 0 {
-                        let dtw_sec = (data.t_dtw as f64) / 100.0;
-                        if dtw_sec >= seg_start - 0.25 && dtw_sec <= seg_end + 0.25 {
-                            if dtw_sec - tok_start > 0.60 {
-                                tok_start = (dtw_sec - 0.15).max(tok_start);
+                    if let Ok(n_tokens) = state.full_n_tokens(i) {
+                        for t in 0..n_tokens {
+                            let Ok(data) = state.full_get_token_data(i, t) else {
+                                continue;
+                            };
+                            if data.id >= eot_id {
+                                continue;
                             }
-                            if tok_end - dtw_sec > 0.80 {
-                                tok_end = (dtw_sec + 0.35).min(tok_end);
+                            let raw_tok = state.full_get_token_text_lossy(i, t).unwrap_or_default();
+                            let tok_trimmed = raw_tok.trim();
+                            if tok_trimmed.is_empty()
+                                || tok_trimmed.starts_with("[_")
+                                || tok_trimmed.starts_with("<|")
+                            {
+                                continue;
                             }
-                            if tok_end <= tok_start {
-                                tok_end = (dtw_sec + 0.15).min(seg_end).max(tok_start + 0.05);
+
+                            prob_sum += data.p;
+                            prob_count += 1;
+
+                            let mut tok_start = (chunk_start + data.t0 as f64 / 100.0).max(seg_start);
+                            let mut tok_end = (chunk_start + data.t1 as f64 / 100.0)
+                                .min(seg_end)
+                                .max(tok_start);
+
+                            if data.t_dtw >= 0 {
+                                let dtw_sec = chunk_start + (data.t_dtw as f64) / 100.0;
+                                if dtw_sec >= seg_start - 0.50 && dtw_sec <= seg_end + 0.50 {
+                                    if dtw_sec < tok_start - 0.30 {
+                                        tok_start = (dtw_sec - 0.10).max(seg_start);
+                                    } else if dtw_sec - tok_start > 0.60 {
+                                        tok_start = (dtw_sec - 0.15).max(tok_start);
+                                    }
+                                    let rel_drop = if options.isolated { 16.0 } else { 8.0 };
+                                    if tok_end - dtw_sec > 0.90
+                                        && energy.mean_db_in_range(dtw_sec + 0.45, tok_end)
+                                            < energy.peak_db_in_range(tok_start, dtw_sec + 0.45)
+                                                - rel_drop
+                                    {
+                                        tok_end = (dtw_sec + 0.55).min(tok_end);
+                                    }
+                                    if tok_end <= tok_start {
+                                        tok_end =
+                                            (dtw_sec + 0.20).min(seg_end).max(tok_start + 0.05);
+                                    }
+                                }
+                            }
+
+                            let starts_new_word = seg_words.is_empty()
+                                || raw_tok.starts_with(|c: char| c.is_whitespace())
+                                || tok_trimmed.chars().next().is_some_and(is_unspaced_char)
+                                || seg_words
+                                    .last()
+                                    .and_then(|w| w.text.chars().last())
+                                    .is_some_and(is_unspaced_char);
+
+                            if starts_new_word {
+                                seg_words.push(TimedWord {
+                                    start: tok_start,
+                                    end: tok_end,
+                                    text: tok_trimmed.to_string(),
+                                    prob: data.p,
+                                });
+                            } else if let Some(prev_word) = seg_words.last_mut() {
+                                prev_word.text.push_str(tok_trimmed);
+                                prev_word.end = prev_word.end.max(tok_end);
+                                prev_word.prob = (prev_word.prob + data.p) * 0.5;
                             }
                         }
                     }
 
-                    let starts_new_word = seg_words.is_empty()
-                        || raw_tok.starts_with(|c: char| c.is_whitespace())
-                        || tok_trimmed.chars().next().is_some_and(is_unspaced_char)
-                        || seg_words
-                            .last()
-                            .and_then(|w| w.text.chars().last())
-                            .is_some_and(is_unspaced_char);
+                    for w in &mut seg_words {
+                        if w.end - w.start > 1.60 {
+                            w.end = energy.trim_trailing_tail(
+                                w.start,
+                                w.end,
+                                (w.start + 0.50).min(w.end),
+                                options.isolated,
+                            );
+                        }
+                    }
 
-                    if starts_new_word {
-                        seg_words.push(TimedWord {
-                            start: tok_start,
-                            end: tok_end,
-                            text: tok_trimmed.to_string(),
-                            prob: data.p,
+                    let avg_prob = if prob_count > 0 {
+                        prob_sum / (prob_count as f32)
+                    } else {
+                        1.0
+                    };
+
+                    if prob_count > 0 && avg_prob < 0.20 {
+                        tracing::debug!(
+                            "Dropping low-confidence segment (avg_prob={:.2}): {}",
+                            avg_prob,
+                            raw_text
+                        );
+                        continue;
+                    }
+
+                    let sub_groups = if seg_words.is_empty() {
+                        vec![Vec::new()]
+                    } else {
+                        split_segment_by_word_pauses(&seg_words)
+                    };
+                    let split_used_raw = sub_groups.len() == 1 && seg_words.is_empty();
+
+                    for mut sub_words in sub_groups {
+                        let sub_text = if split_used_raw {
+                            raw_text.clone()
+                        } else {
+                            join_words_text(&sub_words)
+                        };
+                        if sub_text.is_empty() || is_hallucination(&sub_text) {
+                            continue;
+                        }
+
+                        let sub_prob = if sub_words.is_empty() {
+                            avg_prob
+                        } else {
+                            sub_words.iter().map(|w| w.prob).sum::<f32>()
+                                / (sub_words.len() as f32)
+                        };
+                        if !sub_words.is_empty() && sub_prob < 0.20 {
+                            continue;
+                        }
+                        if (sub_words.len() == 1 || sub_text.split_whitespace().count() == 1)
+                            && is_lone_filler_word(&sub_text)
+                            && sub_prob < 0.80
+                        {
+                            continue;
+                        }
+
+                        let raw_start = sub_words.first().map(|w| w.start).unwrap_or(seg_start);
+                        let raw_end = sub_words
+                            .last()
+                            .map(|w| w.end)
+                            .unwrap_or(seg_end)
+                            .max(raw_start);
+
+                        let (refined_start, refined_end) =
+                            energy.refine_bounds(raw_start, raw_end, options.isolated);
+
+                        if sub_text.split_whitespace().count() <= 3
+                            && (refined_end - refined_start) >= 10.0
+                        {
+                            tracing::debug!(
+                                "Dropping stretched instrumental-solo phantom ({:.2}s..{:.2}s): {}",
+                                refined_start,
+                                refined_end,
+                                sub_text
+                            );
+                            continue;
+                        }
+
+                        if energy.peak_db_in_range(refined_start, refined_end) < -52.0 {
+                            tracing::debug!(
+                                "Dropping silent/non-vocal phantom segment at {:.2}s: {}",
+                                refined_start,
+                                sub_text
+                            );
+                            continue;
+                        }
+
+                        if is_hallucination_loop(
+                            &attempt_history,
+                            &sub_text,
+                            refined_start,
+                            refined_end,
+                            sub_prob,
+                        ) {
+                            tracing::debug!(
+                                "Dropping hallucination loop segment (avg_prob={:.2}): {}",
+                                sub_prob,
+                                sub_text
+                            );
+                            continue;
+                        }
+
+                        attempt_history.push(KeptSegmentMeta {
+                            norm_text: sub_text.trim().to_lowercase(),
+                            start_sec: refined_start,
                         });
-                    } else if let Some(prev_word) = seg_words.last_mut() {
-                        prev_word.text.push_str(tok_trimmed);
-                        prev_word.end = prev_word.end.max(tok_end);
-                        prev_word.prob = (prev_word.prob + data.p) * 0.5;
+                        if attempt_history.len() > 8 {
+                            attempt_history.remove(0);
+                        }
+
+                        for w in &mut sub_words {
+                            let ws = w.start.max(refined_start).min(refined_end);
+                            let we = w.end.min(refined_end).max(ws);
+                            w.start = round_centis(ws);
+                            w.end = round_centis(we);
+                        }
+                        chunk_words.extend(sub_words.iter().cloned());
+
+                        let start = round_centis(refined_start);
+                        let end = round_centis(refined_end).max(start);
+                        let ts = format_lrc_timestamp(start);
+
+                        chunk_segments.push(LrcSegment {
+                            start,
+                            end,
+                            timestamp: ts,
+                            text: sub_text,
+                            words: sub_words,
+                        });
                     }
                 }
+
+                if !chunk_segments.is_empty() {
+                    history = attempt_history;
+                    segments.extend(chunk_segments);
+                    all_words.extend(chunk_words);
+                    break;
+                }
             }
-
-            let avg_prob = if prob_count > 0 {
-                prob_sum / (prob_count as f32)
-            } else {
-                1.0
-            };
-
-            if prob_count > 0 && avg_prob < 0.20 {
-                tracing::debug!(
-                    "Dropping low-confidence segment (avg_prob={:.2}): {}",
-                    avg_prob,
-                    text
-                );
-                continue;
-            }
-
-            let raw_start = seg_words.first().map(|w| w.start).unwrap_or(seg_start);
-            let raw_end = seg_words
-                .last()
-                .map(|w| w.end)
-                .unwrap_or(seg_end)
-                .max(raw_start);
-
-            let (refined_start, refined_end) =
-                energy.refine_bounds(raw_start, raw_end, options.isolated);
-
-            if energy.peak_db_in_range(refined_start, refined_end) < -52.0 {
-                tracing::debug!(
-                    "Dropping silent/non-vocal phantom segment at {:.2}s: {}",
-                    refined_start,
-                    text
-                );
-                continue;
-            }
-
-            if is_hallucination_loop(&history, &text, refined_start, refined_end, avg_prob) {
-                tracing::debug!(
-                    "Dropping hallucination loop segment (avg_prob={:.2}): {}",
-                    avg_prob,
-                    text
-                );
-                continue;
-            }
-
-            history.push(KeptSegmentMeta {
-                norm_text: text.trim().to_lowercase(),
-                start_sec: refined_start,
-            });
-            if history.len() > 8 {
-                history.remove(0);
-            }
-
-            for w in &mut seg_words {
-                let ws = w.start.max(refined_start).min(refined_end);
-                let we = w.end.min(refined_end).max(ws);
-                w.start = round_centis(ws);
-                w.end = round_centis(we);
-            }
-            all_words.extend(seg_words.iter().cloned());
-
-            let start = round_centis(refined_start);
-            let end = round_centis(refined_end).max(start);
-            let ts = format_lrc_timestamp(start);
-
-            segments.push(LrcSegment {
-                start,
-                end,
-                timestamp: ts,
-                text,
-                words: seg_words,
-            });
         }
+
+        let inference_dur = t0.elapsed();
+        tracing::info!(
+            "Whisper inference finished in {:.2?} (raw segments: {}, kept: {})",
+            inference_dur,
+            total_raw_segments,
+            segments.len()
+        );
 
         let mut aligned = false;
         let mut final_segments = segments;
@@ -881,5 +1210,82 @@ mod tests {
         assert!(is_hallucination_loop(&loop_hist, "Me", 205.0, 206.0, 0.30));
         // Same alternating pattern with high singing confidence is preserved
         assert!(!is_hallucination_loop(&loop_hist, "Me", 205.0, 206.0, 0.85));
+
+        // High-confidence 1s-spaced consecutive greedy loop is dropped after 2 repetitions
+        let fast_loop = vec![
+            KeptSegmentMeta { norm_text: "and i'm always in the dark".into(), start_sec: 140.0 },
+            KeptSegmentMeta { norm_text: "and i'm always in the dark".into(), start_sec: 141.0 },
+        ];
+        assert!(is_hallucination_loop(
+            &fast_loop,
+            "And I'm always in the dark",
+            142.0,
+            143.0,
+            0.95
+        ));
+
+        // Legitimate spaced hook repeats (>= 2.6s apart) are preserved
+        let hook_hist = vec![
+            KeptSegmentMeta { norm_text: "listen, listen, listen".into(), start_sec: 178.46 },
+            KeptSegmentMeta { norm_text: "listen, listen, listen".into(), start_sec: 182.10 },
+            KeptSegmentMeta { norm_text: "listen, listen, listen".into(), start_sec: 185.73 },
+        ];
+        assert!(!is_hallucination_loop(
+            &hook_hist,
+            "Listen, listen, listen",
+            189.37,
+            191.0,
+            0.90
+        ));
+    }
+
+    #[test]
+    fn test_split_segment_by_word_pauses_splits_chorus_lines_cleanly() {
+        let mk = |s, e, t: &str| TimedWord {
+            start: s,
+            end: e,
+            text: t.to_string(),
+            prob: 0.9,
+        };
+        let words = vec![
+            mk(145.25, 145.6, "There's"),
+            mk(145.6, 146.2, "nothing"),
+            mk(146.2, 146.4, "I"),
+            mk(146.4, 147.2, "can"),
+            mk(147.2, 147.7, "do"),
+            mk(147.72, 148.0, "A"),
+            mk(148.0, 148.6, "total"),
+            mk(148.6, 149.2, "eclipse"),
+            mk(149.2, 149.4, "of"),
+            mk(149.4, 149.6, "the"),
+            mk(149.6, 149.9, "heart"),
+        ];
+        let groups = split_segment_by_word_pauses(&words);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(join_words_text(&groups[0]), "There's nothing I can do");
+        assert_eq!(join_words_text(&groups[1]), "A total eclipse of the heart");
+
+        // Connector word + brief pause must NOT orphan a single trailing lowercase word ("heart")
+        let connected = vec![
+            mk(147.24, 147.90, "A"),
+            mk(147.90, 148.30, "total"),
+            mk(148.30, 148.70, "eclipse"),
+            mk(148.70, 148.90, "of"),
+            mk(148.90, 149.10, "the"),
+            mk(149.70, 150.20, "heart"),
+        ];
+        let connected_groups = split_segment_by_word_pauses(&connected);
+        assert_eq!(connected_groups.len(), 1);
+        assert_eq!(
+            join_words_text(&connected_groups[0]),
+            "A total eclipse of the heart"
+        );
+    }
+
+    #[test]
+    fn test_is_hallucination_drops_vocalise_loops_keeps_real_lyrics() {
+        assert!(is_hallucination("Ooh, ooh, ooh, ooh"));
+        assert!(!is_hallucination("Listen, listen, listen"));
+        assert!(!is_hallucination("La, la, la, la"));
     }
 }

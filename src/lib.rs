@@ -107,19 +107,19 @@ pub async fn to_lrc_with_options(
         });
 
     options.prompt = build_initial_prompt(effective_artist, effective_title, prompt_hint.as_deref());
-    options.isolated = isolate_vocals_first;
 
-    let mut decoded = if isolate_vocals_first {
+    let (mut decoded, actually_isolated) = if isolate_vocals_first {
         match isolate_vocals_to_16k_mono(audio_bytes, &model_dir).await {
-            Ok(d) => d,
+            Ok(d) => (d, true),
             Err(e) => {
                 tracing::warn!("demucs-rs vocal isolation failed, falling back to raw audio: {e}");
-                decode_audio_to_16k_mono(audio_bytes)?
+                (decode_audio_to_16k_mono(audio_bytes)?, false)
             }
         }
     } else {
-        decode_audio_to_16k_mono(audio_bytes)?
+        (decode_audio_to_16k_mono(audio_bytes)?, false)
     };
+    options.isolated = actually_isolated;
 
     apply_rms_silence_gate(&mut decoded.pcm, 16000, -42.0);
 
